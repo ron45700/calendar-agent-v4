@@ -1,0 +1,17 @@
+# .gitignore
+
+# Environment variables (SENSITIVE!)
+.env
+
+# Google Credentials (SENSITIVE!)
+*.json
+service-account.json
+client_secret.json
+
+# Python virtual environment
+.venv/
+venv/
+
+# Bytecode
+__pycache__/
+*.pyc
