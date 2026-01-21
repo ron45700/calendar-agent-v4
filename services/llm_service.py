@@ -1,6 +1,13 @@
 """
 LLM Service for Agentic Calendar 2.0
-Handles natural language event parsing using OpenAI function calling.
+Intelligent Agent - Intent Classification & Routing
+
+Classifies user input into:
+- create_event: Schedule calendar events
+- set_reminder: Ad-hoc reminders (pings)
+- reschedule_event: Move/postpone events
+- edit_preferences: Settings changes
+- chat: General conversation
 """
 
 import json
@@ -8,145 +15,65 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from services.openai_service import openai_service
+from services.prompts import ROUTER_SYSTEM_PROMPT, INTENT_FUNCTION_SCHEMA
 
-
-# =============================================================================
-# Event Parsing Schema (OpenAI Function Calling)
-# =============================================================================
-
-EVENT_PARSING_FUNCTION = {
-    "name": "create_calendar_event",
-    "description": "Extract structured event data from natural language text for Google Calendar",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "summary": {
-                "type": "string",
-                "description": "The event title/summary"
-            },
-            "start_time": {
-                "type": "string",
-                "description": "Event start time in ISO 8601 format (e.g., 2026-01-21T14:00:00)"
-            },
-            "end_time": {
-                "type": "string",
-                "description": "Event end time in ISO 8601 format. If duration not specified, default to 1 hour after start"
-            },
-            "description": {
-                "type": "string",
-                "description": "Event description (only if explicitly mentioned in the text)"
-            },
-            "attendees": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of attendee names mentioned in the text"
-            },
-            "category": {
-                "type": "string",
-                "enum": ["work", "meeting", "personal", "family", "health", "sport", "study", "fun", "other"],
-                "description": "Suggested category for the event based on context"
-            },
-            "is_all_day": {
-                "type": "boolean",
-                "description": "True if the user said it is an all-day event"
-            },
-            "location": {
-                "type": "string",
-                "description": "Event location if mentioned"
-            }
-        },
-        "required": ["summary", "start_time", "end_time", "category"]
-    }
-}
-
-PARSING_SYSTEM_PROMPT = """You are an advanced NLU (Natural Language Understanding) engine for a Calendar Agent.
-Your goal is to extract structured calendar event data from Hebrew user input.
-
-**Context:**
-- **Current Reference Time:** {current_time} (Timezone: Asia/Jerusalem).
-- **User's Contacts:** {contacts} (List of known names).
-
-**Extraction Rules:**
-1.  **Summary:** Extract the event title from the text. Keep it in Hebrew unless the user wrote in English.
-2.  **Timing (Crucial):**
-    - Calculate `start_time` relative to the **Current Reference Time**.
-    - Handle Hebrew relative terms accurately:
-      - "מחר" (Tomorrow) -> Current Date + 1 day.
-      - "עוד שעה" (In an hour) -> Current Time + 1 hour.
-      - "יום שלישי הבא" (Next Tuesday).
-    - If no specific hour is mentioned (e.g., "Birthday on the 5th"), mark `is_all_day` as true.
-3.  **Duration:**
-    - Calculate `end_time` based on the user's input (e.g., "for two hours").
-    - **Default:** If no duration is specified, assume exactly **1 hour** from start time.
-4.  **Attendees:**
-    - Scan the text for names present in the **User's Contacts** list.
-    - Only include names that strictly match (fuzzy match is allowed for nicknames if obvious).
-5.  **Description:**
-    - Only add a `description` if the user explicitly dictates details (e.g., "write in description that..."). Otherwise, leave empty.
-6.  **Category:**
-    - Classify the event into one of these types: "work", "personal", "family", "health", "social", "education".
-
-**Output Requirements:**
-- Return a valid JSON object.
-- **Dates:** Must be in ISO 8601 format (YYYY-MM-DDTHH:MM:SS).
-- **Timezone:** Ensure calculation considers Israel Standard Time (IST).
-
-**Few-Shot Examples (Hebrew Input -> JSON Logic):**
-
-Input: "פגישה עם דני מחר ב-15:00"
-Logic: "מחר" means (Current Day + 1). Time is 15:00. Duration default 1h.
-Output: {{"summary": "פגישה עם דני", "start_time": "2024-01-22T15:00:00", "end_time": "2024-01-22T16:00:00", "attendees": ["דני"], "is_all_day": false}}
-
-Input: "יש לי חדר כושר עוד שעתיים"
-Logic: "עוד שעתיים" means (Current Time + 2 hours). Duration default 1h. Category: health/sport.
-Output: {{"summary": "חדר כושר", "start_time": "[Calculated]", "end_time": "[Calculated + 1h]", "category": "health"}}
-
-Input: "יום הולדת לאמא ב-25 לחודש"
-Logic: Specific date, no time specified.
-Output: {{"summary": "יום הולדת לאמא", "start_time": "2024-01-25", "is_all_day": true, "category": "family"}}
-"""
 
 class LLMService:
     """
-    Service for LLM-based natural language understanding.
-    Uses OpenAI function calling for structured event extraction.
+    Intelligent Agent Service for intent classification and routing.
+    Uses OpenAI function calling for structured intent extraction.
     """
     
     def __init__(self):
         """Initialize LLM service."""
         pass
     
-    async def parse_event_from_text(
+    async def parse_user_intent(
         self,
         text: str,
         current_time: str,
-        contacts: Optional[Dict[str, str]] = None
-    ) -> Optional[Dict[str, Any]]:
+        user_preferences: Optional[Dict[str, Any]] = None,
+        contacts: Optional[Dict[str, str]] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        agent_name: str = "הבוט",
+        user_nickname: str = "חבר"
+    ) -> Dict[str, Any]:
         """
-        Parse natural language text into structured event data.
+        Classify user intent and extract structured data.
         
         Args:
-            text: User's natural language input (e.g., "פגישה עם דני מחר ב-15:00")
+            text: User's natural language input
             current_time: Current datetime string for resolving relative times
-            contacts: User's contact dict {name: email} for attendee resolution
+            user_preferences: User's preference settings (colors, reminders, etc.)
+            contacts: User's contact dict {name: email}
+            history: Conversation history for context
+            agent_name: Bot's name chosen by user
+            user_nickname: User's nickname
             
         Returns:
-            Structured event data dict or None if parsing failed
+            Dict with intent, response_text, and payload
         """
         # Format contacts for the prompt
         contact_names = list(contacts.keys()) if contacts else []
-        contacts_str = ", ".join(contact_names) if contact_names else "אין אנשי קשר שמורים"
+        contacts_str = ", ".join(contact_names) if contact_names else "אין אנשי קשר"
         
-        # Build system prompt
-        system_prompt = PARSING_SYSTEM_PROMPT.format(
+        # Format preferences
+        prefs_str = json.dumps(user_preferences, ensure_ascii=False) if user_preferences else "{}"
+        
+        # Build system prompt from template
+        system_prompt = ROUTER_SYSTEM_PROMPT.format(
+            agent_name=agent_name,
+            user_nickname=user_nickname,
             current_time=current_time,
-            contacts=contacts_str
+            contacts=contacts_str,
+            user_preferences=prefs_str
         )
         
-        # Build messages
-        messages = [
-            {"role": "user", "content": text}
-        ]
+        # Build messages with history
+        messages = []
+        if history:
+            messages.extend(history[-10:])
+        messages.append({"role": "user", "content": text})
         
         try:
             # Call OpenAI with function calling
@@ -156,42 +83,53 @@ class LLMService:
                     {"role": "system", "content": system_prompt},
                     *messages
                 ],
-                functions=[EVENT_PARSING_FUNCTION],
-                function_call={"name": "create_calendar_event"},
-                temperature=0.3  # Lower temperature for more deterministic parsing
+                functions=[INTENT_FUNCTION_SCHEMA],
+                function_call={"name": "classify_user_intent"},
+                temperature=0.4
             )
             
             # Extract function call result
             message = response.choices[0].message
             
             if message.function_call:
-                function_args = json.loads(message.function_call.arguments)
-                print(f"[LLM] Parsed event: {function_args}")
+                result = json.loads(message.function_call.arguments)
+                print(f"[LLM] Intent: {result.get('intent')} | Payload: {result.get('payload', {})}")
                 
-                # Resolve attendee names to emails
-                if contacts and function_args.get("attendees"):
-                    resolved_attendees = []
-                    for name in function_args["attendees"]:
-                        # Try to match contact name (case-insensitive)
-                        for contact_name, email in contacts.items():
-                            if name.lower() in contact_name.lower() or contact_name.lower() in name.lower():
-                                resolved_attendees.append({
-                                    "name": contact_name,
-                                    "email": email
-                                })
-                                break
-                    function_args["resolved_attendees"] = resolved_attendees
+                # Ensure payload exists
+                if "payload" not in result:
+                    result["payload"] = {}
                 
-                return function_args
+                # Resolve attendee names to emails for create_event
+                if result.get("intent") == "create_event" and contacts:
+                    attendees = result.get("payload", {}).get("attendees", [])
+                    if attendees:
+                        resolved = []
+                        for name in attendees:
+                            for contact_name, email in contacts.items():
+                                if name.lower() in contact_name.lower() or contact_name.lower() in name.lower():
+                                    resolved.append({"name": contact_name, "email": email})
+                                    break
+                        result["payload"]["resolved_attendees"] = resolved
+                
+                return result
             else:
-                print("[LLM] No function call in response")
-                return None
+                # Fallback to chat intent
+                return {
+                    "intent": "chat",
+                    "response_text": "לא הבנתי לגמרי, אפשר לנסח אחרת?",
+                    "payload": {}
+                }
                 
         except Exception as e:
-            print(f"[LLM] Error parsing event: {e}")
+            print(f"[LLM] Error classifying intent: {e}")
             import traceback
             traceback.print_exc()
-            return None
+            
+            return {
+                "intent": "chat",
+                "response_text": "אופס, משהו השתבש. נסה שוב?",
+                "payload": {}
+            }
     
     async def confirm_event_details(
         self,
@@ -202,7 +140,7 @@ class LLMService:
         Generate a confirmation message for the parsed event.
         
         Args:
-            event_data: Parsed event data
+            event_data: Parsed event data (from payload)
             agent_name: Bot's name for personalized response
             
         Returns:
@@ -214,6 +152,7 @@ class LLMService:
         attendees = event_data.get("attendees", [])
         category = event_data.get("category", "other")
         location = event_data.get("location", "")
+        is_task = event_data.get("is_task", False)
         
         # Format time for display
         try:
@@ -224,7 +163,11 @@ class LLMService:
             time_str = f"{start_time} - {end_time}"
         
         # Build confirmation message
-        msg = f"📅 *{summary}*\n"
+        if is_task:
+            msg = f"📋 *{summary}* (משימה)\n"
+        else:
+            msg = f"📅 *{summary}*\n"
+        
         msg += f"⏰ {time_str}\n"
         
         if location:

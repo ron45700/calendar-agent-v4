@@ -236,6 +236,110 @@ class FirestoreService:
         if user:
             return user.get("current_state")
         return None
+    
+    # =========================================================================
+    # Message History Operations (Conversation Memory)
+    # =========================================================================
+    
+    def _messages_collection(self, user_id: int):
+        """Get reference to user's messages sub-collection."""
+        return self._user_ref(user_id).collection("messages")
+    
+    def save_message(
+        self,
+        user_id: int,
+        role: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Save a message to the user's conversation history.
+        
+        Args:
+            user_id: Telegram user ID
+            role: Message role - "user" or "assistant"
+            content: Message content text
+            metadata: Optional additional metadata (e.g., voice=True)
+            
+        Returns:
+            The document ID of the saved message
+        """
+        message_data = {
+            "role": role,
+            "content": content,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "created_at": datetime.utcnow()
+        }
+        
+        if metadata:
+            message_data["metadata"] = metadata
+        
+        # Add to sub-collection
+        doc_ref = self._messages_collection(user_id).add(message_data)
+        message_id = doc_ref[1].id
+        
+        print(f"[Firestore] Saved {role} message for user {user_id}: {content[:50]}...")
+        return message_id
+    
+    def get_recent_messages(
+        self,
+        user_id: int,
+        limit: int = 10
+    ) -> list:
+        """
+        Get recent messages from user's conversation history.
+        
+        Args:
+            user_id: Telegram user ID
+            limit: Maximum number of messages to retrieve
+            
+        Returns:
+            List of message dicts: [{'role': 'user', 'content': '...'}, ...]
+            Ordered by timestamp ascending (oldest first)
+        """
+        messages_ref = self._messages_collection(user_id)
+        
+        # Get messages ordered by timestamp descending (newest first), then reverse
+        query = messages_ref.order_by(
+            "created_at", direction=firestore.Query.DESCENDING
+        ).limit(limit)
+        
+        docs = query.stream()
+        
+        messages = []
+        for doc in docs:
+            data = doc.to_dict()
+            messages.append({
+                "role": data.get("role", "user"),
+                "content": data.get("content", "")
+            })
+        
+        # Reverse to get chronological order (oldest first)
+        messages.reverse()
+        
+        print(f"[Firestore] Retrieved {len(messages)} messages for user {user_id}")
+        return messages
+    
+    def clear_message_history(self, user_id: int) -> int:
+        """
+        Clear all messages from user's history.
+        
+        Args:
+            user_id: Telegram user ID
+            
+        Returns:
+            Number of messages deleted
+        """
+        messages_ref = self._messages_collection(user_id)
+        docs = messages_ref.stream()
+        
+        count = 0
+        for doc in docs:
+            doc.reference.delete()
+            count += 1
+        
+        print(f"[Firestore] Cleared {count} messages for user {user_id}")
+        return count
 
 
 # Singleton instance for easy import
