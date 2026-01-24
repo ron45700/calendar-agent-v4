@@ -1,15 +1,20 @@
 """
 Firestore service for Agentic Calendar 2.0
 Handles all database operations for user data.
+Supports file-based and environment variable credentials for Cloud Run.
 """
 
+import os
+import json
+import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
 from google.cloud import firestore
 from google.oauth2 import service_account
 
-from config import GOOGLE_APPLICATION_CREDENTIALS
 from models.user import UserData, create_default_user
+
+logger = logging.getLogger(__name__)
 
 
 class FirestoreService:
@@ -26,16 +31,42 @@ class FirestoreService:
     
     @property
     def db(self) -> firestore.Client:
-        """Lazy initialization of Firestore client."""
+        """
+        Lazy initialization of Firestore client with 3-step fallback:
+        1. Local file (service-account.json)
+        2. Environment variable (GOOGLE_CREDENTIALS_JSON)
+        3. Default credentials (Cloud Run automatic)
+        """
         if self._db is None:
-            if GOOGLE_APPLICATION_CREDENTIALS:
-                credentials = service_account.Credentials.from_service_account_file(
-                    GOOGLE_APPLICATION_CREDENTIALS
-                )
+            credentials = None
+            
+            # Step 1: Try local service account file
+            sa_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json")
+            if os.path.exists(sa_file):
+                try:
+                    credentials = service_account.Credentials.from_service_account_file(sa_file)
+                    logger.info(f"[Firestore] ✅ Loaded credentials from file: {sa_file}")
+                except Exception as e:
+                    logger.warning(f"[Firestore] Failed to load from file: {e}")
+            
+            # Step 2: Try GOOGLE_CREDENTIALS_JSON environment variable
+            if credentials is None:
+                creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+                if creds_json:
+                    try:
+                        info = json.loads(creds_json)
+                        credentials = service_account.Credentials.from_service_account_info(info)
+                        logger.info("[Firestore] ✅ Loaded credentials from GOOGLE_CREDENTIALS_JSON env var")
+                    except Exception as e:
+                        logger.warning(f"[Firestore] Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+            
+            # Step 3: Create client with credentials or default
+            if credentials:
                 self._db = firestore.Client(credentials=credentials)
             else:
-                # Use default credentials (for Cloud Run or local gcloud auth)
+                logger.warning("[Firestore] ⚠️ Using default credentials (Cloud Run or gcloud auth)")
                 self._db = firestore.Client()
+        
         return self._db
     
     def _user_ref(self, user_id: int) -> firestore.DocumentReference:
@@ -112,6 +143,17 @@ class FirestoreService:
         """
         self._user_ref(user_id).delete()
         print(f"[Firestore] Deleted user: {user_id}")
+    
+    def update_last_seen(self, user_id: int) -> None:
+        """
+        Update user's last_seen timestamp to current time.
+        
+        Args:
+            user_id: Telegram user ID
+        """
+        self._user_ref(user_id).update({
+            "last_seen": datetime.utcnow()
+        })
     
     # =========================================================================
     # Token Operations

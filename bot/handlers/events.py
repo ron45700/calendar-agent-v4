@@ -48,18 +48,18 @@ def find_missing_contacts(
 ) -> List[str]:
     """
     Find attendee names that don't have emails in user's contact list.
+    
+    Uses STRICT EXACT MATCHING to prevent false positives.
+    "Revach" ≠ "Roy", "Dan" ≠ "Daniel"
     """
     missing = []
-    contact_names_lower = {name.lower(): name for name in user_contacts.keys()}
+    # Create case-insensitive lookup for exact matches only
+    contact_names_lower = {name.lower().strip(): name for name in user_contacts.keys()}
     
     for name in attendee_names:
-        name_lower = name.lower()
-        found = False
-        for contact_lower, contact_name in contact_names_lower.items():
-            if name_lower in contact_lower or contact_lower in name_lower:
-                found = True
-                break
-        if not found:
+        name_lower = name.lower().strip()
+        # STRICT: Exact match only
+        if name_lower not in contact_names_lower:
             missing.append(name)
     
     return missing
@@ -71,16 +71,23 @@ def resolve_attendee_emails(
 ) -> List[Dict[str, str]]:
     """
     Resolve attendee names to emails from user's contact list.
+    
+    Uses STRICT EXACT MATCHING to prevent false positives.
+    Only resolves if the name is an exact match (case-insensitive).
     """
     resolved = []
-    contact_names_lower = {name.lower(): (name, email) for name, email in user_contacts.items()}
+    # Create case-insensitive lookup for exact matches only
+    contact_names_lower = {
+        name.lower().strip(): (name, email) 
+        for name, email in user_contacts.items()
+    }
     
     for name in attendee_names:
-        name_lower = name.lower()
-        for contact_lower, (contact_name, email) in contact_names_lower.items():
-            if name_lower in contact_lower or contact_lower in name_lower:
-                resolved.append({"name": contact_name, "email": email})
-                break
+        name_lower = name.lower().strip()
+        # STRICT: Exact match only
+        if name_lower in contact_names_lower:
+            contact_name, email = contact_names_lower[name_lower]
+            resolved.append({"name": contact_name, "email": email})
     
     return resolved
 

@@ -1,7 +1,11 @@
-# Telegram Bot
+# =============================================================================
+# Agentic Calendar 2.0 - Dependencies
+# =============================================================================
+
+# Telegram Bot Framework
 aiogram>=3.0.0
 
-# Google APIs
+# Google APIs & Auth
 google-api-python-client>=2.0.0
 google-auth>=2.0.0
 google-auth-oauthlib>=1.0.0
@@ -9,9 +13,12 @@ google-auth-oauthlib>=1.0.0
 # Firebase/Firestore
 google-cloud-firestore>=2.0.0
 
+# OpenAI (Whisper & Chat)
+openai>=1.0.0
+
 # Environment & Utilities
 python-dotenv>=1.0.0
 aiohttp>=3.0.0
 
-# OpenAI (Whisper & Chat)
-openai>=1.0.0
+# HTTP Server (for OAuth callback)
+aiohttp>=3.8.0

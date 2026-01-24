@@ -1,10 +1,14 @@
 """
 Configuration module for Agentic Calendar 2.0
 Loads environment variables and defines constants.
+Supports both file-based and environment variable credentials for Cloud Run.
 """
 
 import os
+import json
+from typing import Optional
 from dotenv import load_dotenv
+from google.oauth2 import service_account
 
 # Load environment variables from .env file
 load_dotenv()
@@ -36,6 +40,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Firestore Configuration
 # =============================================================================
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 # =============================================================================
 # Server Configuration
@@ -57,3 +62,46 @@ DEFAULT_COLOR_MAP = {
     "travel": "5",     # Banana
     "health": "6",     # Tangerine
 }
+
+
+# =============================================================================
+# Credential Loading Helper
+# =============================================================================
+
+def get_google_credentials() -> Optional[service_account.Credentials]:
+    """
+    Load Google service account credentials with fallback mechanism.
+    
+    Priority:
+    1. File path from GOOGLE_APPLICATION_CREDENTIALS
+    2. JSON string from GOOGLE_CREDENTIALS_JSON environment variable
+    3. None (will use default credentials in Cloud Run)
+    
+    Returns:
+        service_account.Credentials or None
+    """
+    # Try 1: Load from file path
+    if GOOGLE_APPLICATION_CREDENTIALS:
+        try:
+            if os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
+                credentials = service_account.Credentials.from_service_account_file(
+                    GOOGLE_APPLICATION_CREDENTIALS
+                )
+                print("[Config] Loaded credentials from file")
+                return credentials
+        except Exception as e:
+            print(f"[Config] Failed to load from file: {e}")
+    
+    # Try 2: Load from JSON environment variable
+    if GOOGLE_CREDENTIALS_JSON:
+        try:
+            info = json.loads(GOOGLE_CREDENTIALS_JSON)
+            credentials = service_account.Credentials.from_service_account_info(info)
+            print("[Config] Loaded credentials from GOOGLE_CREDENTIALS_JSON env var")
+            return credentials
+        except Exception as e:
+            print(f"[Config] Failed to load from JSON env var: {e}")
+    
+    # Fallback: Return None (will use default credentials in Cloud Run)
+    print("[Config] No explicit credentials found, will use default credentials")
+    return None

@@ -434,7 +434,6 @@ async def onboarding_contacts(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"🎉 מעולה {nickname}, סיימנו!\n\n"
         f"מעכשיו אתה יכול לקרוא לי *{agent_nickname}*.\n"
-        "אני פה לכל מה שצריך - יומן, תזכורות, משימות.\n\n"
-        "יאללה, מה עושים? 🚀",
+        "🚀 אני פה לכל מה שצריך - יומן, תזכורות, משימות.\n\n",
         parse_mode="Markdown"
     )

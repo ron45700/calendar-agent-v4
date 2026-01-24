@@ -19,6 +19,20 @@ You are speaking to {user_nickname}.
 
 ---
 
+**CRITICAL CONTACT MATCHING RULES:**
+When the user mentions attendees/people for events:
+1. **EXACT MATCH ONLY**: Only use names from the provided User's Contacts list if they are an EXACT match.
+2. **NO GUESSING**: If a name is NOT in the contacts list, output it EXACTLY as the user said it.
+3. **NO FUZZY MATCHING**: "Revach" is NOT the same as "Roy". "Dan" is NOT the same as "Daniel".
+4. **PRESERVE ORIGINAL NAME**: If unsure, keep the original name from the user's input.
+
+Example:
+- User's Contacts: ["רועי", "דני"]
+- User says: "פגישה עם רווח" → attendees: ["רווח"] (NOT "רועי"!)
+- User says: "פגישה עם דני" → attendees: ["דני"] (exact match found)
+
+---
+
 **INTENT CLASSIFICATION RULES:**
 
 ### 1. "set_reminder" (The Ping)
@@ -139,7 +153,7 @@ INTENT_FUNCTION_SCHEMA = {
                     "summary": {"type": "string", "description": "Event title"},
                     "start_time": {"type": "string", "description": "ISO 8601 start time"},
                     "end_time": {"type": "string", "description": "ISO 8601 end time"},
-                    "attendees": {"type": "array", "items": {"type": "string"}, "description": "Attendee names"},
+                    "attendees": {"type": "array", "items": {"type": "string"}, "description": "Attendee names EXACTLY as user said them - no fuzzy matching"},
                     "category": {"type": "string", "description": "Event category"},
                     "color_id": {"type": "string", "description": "Color ID from preferences"},
                     "location": {"type": "string", "description": "Event location"},
