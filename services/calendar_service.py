@@ -4,13 +4,17 @@ Handles Google Calendar API operations using user OAuth tokens.
 """
 
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.cloud import firestore
 
 from config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+from utils.performance import measure_time
 
 
 # =============================================================================
@@ -47,6 +51,10 @@ CATEGORY_COLOR_MAP = {
 
 DEFAULT_COLOR_ID = 7  # Peacock (Cyan)
 
+# Error types for standardized returns
+ERROR_AUTH_REQUIRED = "auth_required"
+ERROR_GENERIC = "generic"
+
 
 class CalendarService:
     """
@@ -56,35 +64,97 @@ class CalendarService:
     
     def __init__(self):
         """Initialize Calendar service."""
-        pass
+        self._firestore_client = None
     
-    def _get_calendar_service(self, user_tokens: Dict[str, str]):
+    @property
+    def firestore_client(self):
+        """Lazy-load Firestore client."""
+        if self._firestore_client is None:
+            self._firestore_client = firestore.Client()
+        return self._firestore_client
+    
+    @measure_time
+    def _get_calendar_service(
+        self, 
+        user_tokens: Dict[str, str],
+        user_id: Optional[str] = None
+    ) -> Tuple[Optional[Any], Optional[str]]:
         """
         Build Google Calendar API service from user tokens.
         
         Args:
             user_tokens: Dict containing access_token, refresh_token, etc.
+            user_id: User ID for credential cleanup on failure
             
         Returns:
-            Google Calendar API service object
+            Tuple of (service, error_status):
+            - (service, None) on success
+            - (None, "auth_required") if tokens are invalid/expired
         """
-        credentials = Credentials(
-            token=user_tokens.get("access_token"),
-            refresh_token=user_tokens.get("refresh_token"),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=GOOGLE_CLIENT_SECRET
-        )
-        
-        return build("calendar", "v3", credentials=credentials)
+        try:
+            credentials = Credentials(
+                token=user_tokens.get("access_token"),
+                refresh_token=user_tokens.get("refresh_token"),
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=GOOGLE_CLIENT_ID,
+                client_secret=GOOGLE_CLIENT_SECRET
+            )
+            
+            # Check if credentials need refresh
+            if credentials.expired or not credentials.valid:
+                print("[Calendar] Credentials expired, attempting refresh...")
+                try:
+                    credentials.refresh(Request())
+                    print("[Calendar] Token refresh successful")
+                except RefreshError as e:
+                    print(f"[Calendar] ⚠️ RefreshError: {e}")
+                    print("[Calendar] Token is invalid/revoked. Clearing credentials.")
+                    
+                    # Delete invalid credentials from Firestore
+                    if user_id:
+                        self._clear_user_credentials(user_id)
+                    
+                    return None, ERROR_AUTH_REQUIRED
+            
+            return build("calendar", "v3", credentials=credentials), None
+            
+        except RefreshError as e:
+            # Catch RefreshError during build() as well
+            print(f"[Calendar] ⚠️ RefreshError during service build: {e}")
+            if user_id:
+                self._clear_user_credentials(user_id)
+            return None, ERROR_AUTH_REQUIRED
+            
+        except Exception as e:
+            print(f"[Calendar] Error building service: {e}")
+            # Return sanitized error type, not raw exception
+            return None, ERROR_GENERIC
     
+    def _clear_user_credentials(self, user_id: str) -> None:
+        """
+        Delete invalid credentials from Firestore.
+        
+        Args:
+            user_id: The Telegram user ID
+        """
+        try:
+            print(f"[Calendar] Deleting invalid credentials for user {user_id}")
+            self.firestore_client.collection('users').document(str(user_id)).update({
+                'google_calendar_token': firestore.DELETE_FIELD
+            })
+            print(f"[Calendar] ✅ Credentials cleared for user {user_id}")
+        except Exception as e:
+            print(f"[Calendar] Error clearing credentials: {e}")
+    
+    @measure_time
     def add_event(
         self,
         user_tokens: Dict[str, str],
         event_data: Dict[str, Any],
         color_id: Optional[int] = None,
-        calendar_id: str = "primary"
-    ) -> Optional[Dict[str, Any]]:
+        calendar_id: str = "primary",
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Add a new event to user's Google Calendar.
         
@@ -93,13 +163,25 @@ class CalendarService:
             event_data: Event data with summary, start_time, end_time, etc.
             color_id: Google Calendar color ID (1-11)
             calendar_id: Calendar ID (default: primary)
+            user_id: User ID for auth cleanup on failure
             
         Returns:
-            Created event data from API or None on failure
+            Dict with either:
+            - {"success": True, "event": created_event} on success
+            - {"success": False, "error": "auth_required"} if auth failed
+            - {"success": False, "error": "message"} on other errors
         """
+        # Get calendar service with auth check
+        service, error = self._get_calendar_service(user_tokens, user_id)
+        
+        if service is None:
+            print(f"[Calendar] Auth failed: {error}")
+            if error == ERROR_AUTH_REQUIRED:
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            else:
+                return {"status": "error", "type": ERROR_GENERIC, "message": "Failed to connect to calendar"}
+        
         try:
-            service = self._get_calendar_service(user_tokens)
-            
             # Build event body
             event_body = {
                 "summary": event_data.get("summary", "New Event"),
@@ -149,17 +231,24 @@ class CalendarService:
                 sendUpdates="all" if event_data.get("resolved_attendees") else "none"
             ).execute()
             
-            print(f"[Calendar] Event created: {created_event.get('id')}")
-            return created_event
+            print(f"[Calendar] ✅ Event created: {created_event.get('id')}")
+            return {"status": "success", "event": created_event}
             
         except HttpError as e:
             print(f"[Calendar] HTTP Error: {e}")
-            return None
+            # Check if it's an auth error (401/403)
+            if e.resp.status in [401, 403]:
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            # Sanitize - don't expose raw error in message
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Calendar API error"}
         except Exception as e:
             print(f"[Calendar] Error creating event: {e}")
             import traceback
             traceback.print_exc()
-            return None
+            # Sanitize - don't expose raw error
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Unexpected error creating event"}
     
     def _format_datetime(self, dt_string: str, is_all_day: bool = False) -> Dict[str, str]:
         """
@@ -191,8 +280,9 @@ class CalendarService:
         self,
         user_tokens: Dict[str, str],
         max_results: int = 10,
-        calendar_id: str = "primary"
-    ) -> List[Dict[str, Any]]:
+        calendar_id: str = "primary",
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Get upcoming events from user's calendar.
         
@@ -200,13 +290,21 @@ class CalendarService:
             user_tokens: User's OAuth tokens
             max_results: Maximum number of events to return
             calendar_id: Calendar ID (default: primary)
+            user_id: User ID for auth cleanup on failure
             
         Returns:
-            List of event dicts
+            Dict with either:
+            - {"success": True, "events": [...]} on success
+            - {"success": False, "error": "auth_required"} if auth failed
         """
+        service, error = self._get_calendar_service(user_tokens, user_id)
+        
+        if service is None:
+            if error == ERROR_AUTH_REQUIRED:
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Failed to connect", "events": []}
+        
         try:
-            service = self._get_calendar_service(user_tokens)
-            
             now = datetime.utcnow().isoformat() + "Z"
             
             events_result = service.events().list(
@@ -219,21 +317,26 @@ class CalendarService:
             
             events = events_result.get("items", [])
             print(f"[Calendar] Found {len(events)} upcoming events")
-            return events
+            return {"status": "success", "events": events}
             
         except HttpError as e:
             print(f"[Calendar] HTTP Error: {e}")
-            return []
+            if e.resp.status in [401, 403]:
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Calendar API error", "events": []}
         except Exception as e:
             print(f"[Calendar] Error fetching events: {e}")
-            return []
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Error fetching events", "events": []}
     
     def delete_event(
         self,
         user_tokens: Dict[str, str],
         event_id: str,
-        calendar_id: str = "primary"
-    ) -> bool:
+        calendar_id: str = "primary",
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Delete an event from user's calendar.
         
@@ -241,27 +344,37 @@ class CalendarService:
             user_tokens: User's OAuth tokens
             event_id: Event ID to delete
             calendar_id: Calendar ID (default: primary)
+            user_id: User ID for auth cleanup on failure
             
         Returns:
-            True if successful, False otherwise
+            Dict with success status and error if applicable
         """
+        service, error = self._get_calendar_service(user_tokens, user_id)
+        
+        if service is None:
+            if error == ERROR_AUTH_REQUIRED:
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Failed to connect"}
+        
         try:
-            service = self._get_calendar_service(user_tokens)
-            
             service.events().delete(
                 calendarId=calendar_id,
                 eventId=event_id
             ).execute()
             
             print(f"[Calendar] Deleted event: {event_id}")
-            return True
+            return {"status": "success"}
             
         except HttpError as e:
             print(f"[Calendar] HTTP Error deleting event: {e}")
-            return False
+            if e.resp.status in [401, 403]:
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Error deleting event"}
         except Exception as e:
             print(f"[Calendar] Error deleting event: {e}")
-            return False
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Error deleting event"}
     
     def get_color_id_for_category(self, category: str, user_color_map: Optional[Dict] = None) -> int:
         """
@@ -284,3 +397,6 @@ class CalendarService:
 
 # Singleton instance
 calendar_service = CalendarService()
+
+# Export auth status constant
+__all__ = ["calendar_service", "CalendarService", "AUTH_REQUIRED"]

@@ -65,3 +65,5 @@ temp/
 # Development
 *.ipynb
 .ipynb_checkpoints/
+
+.for_gem

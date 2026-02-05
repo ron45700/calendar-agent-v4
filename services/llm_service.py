@@ -11,12 +11,14 @@ Classifies user input into:
 """
 
 import json
+import asyncio
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from services.openai_service import openai_service
 from prompts.base import SYSTEM_PROMPT as BASE_SYSTEM_PROMPT
 from prompts.router import ROUTER_SYSTEM_PROMPT, INTENT_FUNCTION_SCHEMA
+from utils.performance import measure_time
 
 
 class LLMService:
@@ -29,6 +31,7 @@ class LLMService:
         """Initialize LLM service."""
         pass
     
+    @measure_time
     async def parse_user_intent(
         self,
         text: str,
@@ -88,17 +91,31 @@ class LLMService:
         messages.append({"role": "user", "content": text})
         
         try:
-            # Call OpenAI with function calling
-            response = openai_service.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    *messages
-                ],
-                functions=[INTENT_FUNCTION_SCHEMA],
-                function_call={"name": "classify_user_intent"},
-                temperature=0.4
-            )
+            # Call OpenAI with function calling - wrap with timeout
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        lambda: openai_service.client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                *messages
+                            ],
+                            functions=[INTENT_FUNCTION_SCHEMA],
+                            function_call={"name": "classify_user_intent"},
+                            temperature=0.4
+                        )
+                    ),
+                    timeout=25.0  # 25 second hard timeout
+                )
+            except asyncio.TimeoutError:
+                print("[LLM] ⚠️ OpenAI request timed out after 25 seconds!")
+                return {
+                    "intent": "chat",
+                    "response_text": "🕐 המערכת עמוסה כרגע, נסה שוב בעוד רגע.",
+                    "payload": {},
+                    "system_timeout": True
+                }
             
             # Extract function call result
             message = response.choices[0].message

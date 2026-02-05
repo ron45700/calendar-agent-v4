@@ -28,6 +28,7 @@ from services.llm_service import llm_service
 from services.firestore_service import firestore_service
 from bot.utils import get_random_thinking_phrase, get_formatted_current_time
 from bot.handlers.events import process_create_event
+from utils.performance import measure_time
 
 
 # =============================================================================
@@ -118,6 +119,7 @@ async def check_and_send_welcome_back(message: Message, user: UserData, user_id:
 # =============================================================================
 
 @router.message(F.voice)
+@measure_time
 async def handle_voice_message(message: Message, user: Optional[UserData], bot: Bot, state: FSMContext) -> None:
     """Handle voice messages - transcribe then route via intent classification."""
     user_id = message.from_user.id
@@ -203,6 +205,7 @@ async def handle_voice_message(message: Message, user: Optional[UserData], bot: 
 # =============================================================================
 
 @router.message(F.text)
+@measure_time
 async def handle_text_message(message: Message, user: Optional[UserData], state: FSMContext) -> None:
     """Handle text messages - route via LLM intent classification."""
     user_id = message.from_user.id
@@ -255,6 +258,7 @@ async def handle_text_message(message: Message, user: Optional[UserData], state:
 # Unified Intent Processing
 # =============================================================================
 
+@measure_time
 async def process_user_intent(
     message: Message,
     user: UserData,

@@ -48,6 +48,9 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 OAUTH_SERVER_HOST = os.getenv("OAUTH_SERVER_HOST", "localhost")
 OAUTH_SERVER_PORT = int(os.getenv("OAUTH_SERVER_PORT", "8080"))
 
+# Web app URL for auth links (falls back to BASE_WEBHOOK_URL if not set)
+WEBAPP_URL = os.getenv("WEBAPP_URL", os.getenv("BASE_WEBHOOK_URL", ""))
+
 # =============================================================================
 # Default Values
 # =============================================================================

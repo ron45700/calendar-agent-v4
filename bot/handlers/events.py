@@ -11,10 +11,11 @@ from aiogram.fsm.context import FSMContext
 
 from models.user import UserData
 from services.llm_service import llm_service
-from services.calendar_service import calendar_service
+from services.calendar_service import calendar_service, ERROR_AUTH_REQUIRED, ERROR_GENERIC
 from services.firestore_service import firestore_service
 from bot.states import EventFlowStates
 from bot.utils import get_formatted_current_time
+from config import WEBAPP_URL
 
 
 # Create router for event handlers
@@ -189,41 +190,62 @@ async def create_event_from_payload(
     if not color_id:
         color_id = calendar_service.get_color_id_for_category(category, color_map)
     
-    # Create event
-    created_event = calendar_service.add_event(
+    # Create event - pass user_id for auth cleanup on failure
+    result = calendar_service.add_event(
         user_tokens=tokens,
         event_data=payload,
-        color_id=int(color_id) if color_id else None
+        color_id=int(color_id) if color_id else None,
+        user_id=str(user_id)
     )
     
-    if created_event:
-        event_link = created_event.get("htmlLink", "")
-        summary = payload.get("summary", "אירוע")
+    # Check result status - CRITICAL: Don't lie to user!
+    if result.get("status") != "success":
+        error_type = result.get("type", ERROR_GENERIC)
+        print(f"[Event] ❌ add_event failed with type: {error_type}")
         
-        # Format success message
-        confirmation = await llm_service.confirm_event_details(payload)
-        
-        success_response = (
-            f"✅ *האירוע נוצר בהצלחה!*\n\n"
-            f"{confirmation}\n"
-            f"[פתח ביומן]({event_link})"
-        )
-        
-        # Save assistant response to history
-        firestore_service.save_message(user_id, "assistant", success_response)
-        
-        await message.answer(
-            success_response,
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-    else:
-        error_response = (
-            "❌ שגיאה ביצירת האירוע.\n"
-            "נסה שוב או בדוק את ההרשאות."
-        )
-        firestore_service.save_message(user_id, "assistant", error_response)
-        await message.answer(error_response)
+        if error_type == ERROR_AUTH_REQUIRED:
+            # Auth failed - credentials cleared, need re-login
+            # Use simple text to avoid Markdown parsing issues
+            auth_link = f"{WEBAPP_URL}/auth?user_id={user_id}"
+            error_response = (
+                "🔐 החיבור ליומן התנתק\n\n"
+                "מטעמי אבטחה, Google מנתק את החיבור מדי פעם.\n\n"
+                "שלח /auth להתחברות מחדש."
+            )
+            # Send without Markdown to avoid parsing issues
+            firestore_service.save_message(user_id, "assistant", error_response)
+            await message.answer(error_response)
+        else:
+            # Generic Error - SANITIZED: Never show raw error to user
+            error_response = (
+                "❌ נתקלתי בשגיאה טכנית\n\n"
+                "לא הצלחתי ליצור את האירוע כרגע.\n"
+                "נסה שוב מאוחר יותר."
+            )
+            # Send without Markdown to avoid parsing issues
+            firestore_service.save_message(user_id, "assistant", error_response)
+            await message.answer(error_response)
+        return
+    
+    # SUCCESS - event was created
+    created_event = result.get("event", {})
+    event_link = created_event.get("htmlLink", "")
+    summary = payload.get("summary", "אירוע")
+    
+    # Format success message
+    confirmation = await llm_service.confirm_event_details(payload)
+    
+    success_response = (
+        f"✅ האירוע נוצר בהצלחה!\n\n"
+        f"{confirmation}\n"
+        f"פתח ביומן: {event_link}"
+    )
+    
+    # Save assistant response to history
+    firestore_service.save_message(user_id, "assistant", success_response)
+    
+    # Send without Markdown to be safe
+    await message.answer(success_response, disable_web_page_preview=True)
 
 
 # =============================================================================
