@@ -15,3 +15,5 @@ venv/
 # Bytecode
 __pycache__/
 *.pyc
+
+for_gem/

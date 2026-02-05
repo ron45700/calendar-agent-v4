@@ -4,8 +4,8 @@ Intelligent Agent - Intent Classification & Routing
 
 Classifies user input into:
 - create_event: Schedule calendar events
-- set_reminder: Ad-hoc reminders (pings)
-- reschedule_event: Move/postpone events
+- set_reminder: Ad-hoc reminders (in development)
+- daily_check_setup: Daily check-in (in development)
 - edit_preferences: Settings changes
 - chat: General conversation
 """
@@ -15,7 +15,8 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from services.openai_service import openai_service
-from services.prompts import ROUTER_SYSTEM_PROMPT, INTENT_FUNCTION_SCHEMA
+from prompts.base import SYSTEM_PROMPT as BASE_SYSTEM_PROMPT
+from prompts.router import ROUTER_SYSTEM_PROMPT, INTENT_FUNCTION_SCHEMA
 
 
 class LLMService:
@@ -60,14 +61,25 @@ class LLMService:
         # Format preferences
         prefs_str = json.dumps(user_preferences, ensure_ascii=False) if user_preferences else "{}"
         
-        # Build system prompt from template
-        system_prompt = ROUTER_SYSTEM_PROMPT.format(
+        # Build BASE prompt (Personality & Guardrails)
+        base_prompt = BASE_SYSTEM_PROMPT.format(
+            agent_name=agent_name,
+            user_nickname=user_nickname,
+            current_time=current_time,
+            contacts=contacts_str
+        )
+        
+        # Build ROUTER prompt (Intent Classification)
+        router_prompt = ROUTER_SYSTEM_PROMPT.format(
             agent_name=agent_name,
             user_nickname=user_nickname,
             current_time=current_time,
             contacts=contacts_str,
             user_preferences=prefs_str
         )
+        
+        # Combine: Personality + Router Logic
+        system_prompt = f"{base_prompt}\n\n---\n\n{router_prompt}"
         
         # Build messages with history
         messages = []
