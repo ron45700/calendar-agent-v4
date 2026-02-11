@@ -227,3 +227,40 @@ async def cmd_me(message: Message, user: Optional[UserData]) -> None:
     )
     
     await message.answer(profile_text, parse_mode="Markdown")
+
+
+@router.message(Command("toggle_briefing"))
+async def cmd_toggle_briefing(message: Message, user: Optional[UserData]) -> None:
+    """
+    Handle /toggle_briefing command.
+    Toggles the daily morning briefing on/off.
+    """
+    if not is_registered(user):
+        await message.answer(
+            "❌ אתה צריך להתחבר קודם.\n"
+            "שלח /auth כדי להתחבר."
+        )
+        return
+    
+    user_id = message.from_user.id
+    
+    # Read current state
+    current = user.get("preferences", {}).get("daily_briefing", False)
+    new_value = not current
+    
+    # Update Firestore
+    firestore_service.update_user(user_id, {
+        "preferences.daily_briefing": new_value
+    })
+    
+    if new_value:
+        await message.answer(
+            "☀️ הדיווח היומי הופעל בהצלחה! ✅\n\n"
+            "כל בוקר ב-08:00 תקבל ממני סיכום של הלו\"ז שלך להיום."
+        )
+    else:
+        await message.answer(
+            "🌙 הדיווח היומי כובה בהצלחה! ✅\n\n"
+            "לא אשלח יותר הודעות בוקר. אפשר להפעיל שוב בכל עת."
+        )
+

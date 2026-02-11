@@ -59,6 +59,22 @@ async def health_check(request: web.Request) -> web.Response:
     return web.Response(text="OK", status=200)
 
 
+async def daily_briefing_handler(request: web.Request) -> web.Response:
+    """
+    Endpoint for Cloud Scheduler to trigger daily morning briefing.
+    POST /tasks/daily-briefing
+    """
+    from bot.jobs import send_daily_briefing_job
+    
+    bot = request.app.get("bot")
+    if not bot:
+        return web.json_response({"error": "Bot not initialized"}, status=500)
+    
+    logger.info("[Route] Daily briefing triggered")
+    result = await send_daily_briefing_job(bot)
+    return web.json_response(result, status=200)
+
+
 # =============================================================================
 # Webhook Mode (Cloud Run / Production)
 # =============================================================================
@@ -116,6 +132,13 @@ async def run_webhook_mode(bot: Bot, dp: Dispatcher) -> None:
     
     # Setup application with aiogram integration
     setup_application(app, dp, bot=bot)
+    
+    # Store bot in app for route handlers
+    app["bot"] = bot
+    
+    # Task routes (Cloud Scheduler triggers)
+    app.router.add_post("/tasks/daily-briefing", daily_briefing_handler)
+    logger.info("📋 Registered /tasks/daily-briefing route")
     
     # Start aiohttp server
     runner = web.AppRunner(app)

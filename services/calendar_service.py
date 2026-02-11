@@ -3,8 +3,9 @@ Google Calendar Service for Agentic Calendar 2.0
 Handles Google Calendar API operations using user OAuth tokens.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Optional, Dict, List, Any, Tuple
+from zoneinfo import ZoneInfo
 
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
@@ -51,9 +52,37 @@ CATEGORY_COLOR_MAP = {
 
 DEFAULT_COLOR_ID = 7  # Peacock (Cyan)
 
+# Color ID to Emoji mapping for briefing display
+COLOR_ID_EMOJI = {
+    "1": "🪻",   # Lavender
+    "2": "🟢",   # Sage
+    "3": "🟣",   # Grape
+    "4": "🩷",   # Flamingo
+    "5": "🟡",   # Banana
+    "6": "🟠",   # Tangerine
+    "7": "🔵",   # Peacock
+    "8": "⚫",   # Graphite
+    "9": "🫐",   # Blueberry
+    "10": "🌿",  # Basil
+    "11": "🔴",  # Tomato
+}
+DEFAULT_EVENT_EMOJI = "📅"
+
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+
 # Error types for standardized returns
 ERROR_AUTH_REQUIRED = "auth_required"
 ERROR_GENERIC = "generic"
+
+# Auth error detection patterns (for catching wrapped exceptions)
+AUTH_ERROR_PATTERNS = [
+    "invalid_grant",
+    "Token has been expired",
+    "Token has been revoked",
+    "invalid_token",
+    "access_denied",
+    "unauthorized"
+]
 
 
 class CalendarService:
@@ -126,25 +155,50 @@ class CalendarService:
             return None, ERROR_AUTH_REQUIRED
             
         except Exception as e:
+            error_str = str(e).lower()
             print(f"[Calendar] Error building service: {e}")
-            # Return sanitized error type, not raw exception
+            
+            # CRITICAL: Check if this is actually an auth error wrapped in generic Exception
+            if self._is_auth_error(error_str):
+                print(f"[Calendar] ⚠️ Detected auth error in exception: {e}")
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return None, ERROR_AUTH_REQUIRED
+            
             return None, ERROR_GENERIC
+    
+    def _is_auth_error(self, error_str: str) -> bool:
+        """
+        Check if an error string indicates an authentication/authorization failure.
+        
+        Args:
+            error_str: Lowercase error message string
+            
+        Returns:
+            True if this looks like an auth error
+        """
+        return any(pattern in error_str for pattern in AUTH_ERROR_PATTERNS)
     
     def _clear_user_credentials(self, user_id: str) -> None:
         """
         Delete invalid credentials from Firestore.
         
+        Clears calendar_config token fields so /auth correctly detects
+        that the user needs to re-authenticate.
+        
         Args:
             user_id: The Telegram user ID
         """
         try:
-            print(f"[Calendar] Deleting invalid credentials for user {user_id}")
+            print(f"[Calendar] 🗑️ Purging invalid tokens for user {user_id}")
             self.firestore_client.collection('users').document(str(user_id)).update({
-                'google_calendar_token': firestore.DELETE_FIELD
+                'calendar_config.access_token': firestore.DELETE_FIELD,
+                'calendar_config.refresh_token': firestore.DELETE_FIELD,
+                'calendar_config.token_expiry': firestore.DELETE_FIELD,
             })
-            print(f"[Calendar] ✅ Credentials cleared for user {user_id}")
+            print(f"[Calendar] ✅ Credentials cleared for user {user_id} - /auth will now work")
         except Exception as e:
-            print(f"[Calendar] Error clearing credentials: {e}")
+            print(f"[Calendar] ❌ Error clearing credentials: {e}")
     
     @measure_time
     def add_event(
@@ -243,11 +297,27 @@ class CalendarService:
                 return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
             # Sanitize - don't expose raw error in message
             return {"status": "error", "type": ERROR_GENERIC, "message": "Calendar API error"}
+            
+        except RefreshError as e:
+            # Explicitly catch RefreshError during API call
+            print(f"[Calendar] ⚠️ RefreshError during API call: {e}")
+            if user_id:
+                self._clear_user_credentials(user_id)
+            return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            
         except Exception as e:
+            error_str = str(e).lower()
             print(f"[Calendar] Error creating event: {e}")
             import traceback
             traceback.print_exc()
-            # Sanitize - don't expose raw error
+            
+            # CRITICAL: Check if this is actually an auth error wrapped in generic Exception
+            if self._is_auth_error(error_str):
+                print(f"[Calendar] ⚠️ Detected auth error in exception: {e}")
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            
             return {"status": "error", "type": ERROR_GENERIC, "message": "Unexpected error creating event"}
     
     def _format_datetime(self, dt_string: str, is_all_day: bool = False) -> Dict[str, str]:
@@ -326,8 +396,24 @@ class CalendarService:
                     self._clear_user_credentials(user_id)
                 return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
             return {"status": "error", "type": ERROR_GENERIC, "message": "Calendar API error", "events": []}
+            
+        except RefreshError as e:
+            print(f"[Calendar] ⚠️ RefreshError fetching events: {e}")
+            if user_id:
+                self._clear_user_credentials(user_id)
+            return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            
         except Exception as e:
+            error_str = str(e).lower()
             print(f"[Calendar] Error fetching events: {e}")
+            
+            # Check if this is an auth error wrapped in generic Exception
+            if self._is_auth_error(error_str):
+                print(f"[Calendar] ⚠️ Detected auth error in exception: {e}")
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            
             return {"status": "error", "type": ERROR_GENERIC, "message": "Error fetching events", "events": []}
     
     def delete_event(
@@ -372,8 +458,24 @@ class CalendarService:
                     self._clear_user_credentials(user_id)
                 return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
             return {"status": "error", "type": ERROR_GENERIC, "message": "Error deleting event"}
+            
+        except RefreshError as e:
+            print(f"[Calendar] ⚠️ RefreshError deleting event: {e}")
+            if user_id:
+                self._clear_user_credentials(user_id)
+            return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            
         except Exception as e:
+            error_str = str(e).lower()
             print(f"[Calendar] Error deleting event: {e}")
+            
+            # Check if this is an auth error wrapped in generic Exception
+            if self._is_auth_error(error_str):
+                print(f"[Calendar] ⚠️ Detected auth error in exception: {e}")
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            
             return {"status": "error", "type": ERROR_GENERIC, "message": "Error deleting event"}
     
     def get_color_id_for_category(self, category: str, user_color_map: Optional[Dict] = None) -> int:
@@ -393,6 +495,125 @@ class CalendarService:
         
         # Fall back to default mapping
         return CATEGORY_COLOR_MAP.get(category, DEFAULT_COLOR_ID)
+    
+    def get_today_events(
+        self,
+        user_tokens: Dict[str, str],
+        calendar_id: str = "primary",
+        user_id: Optional[str] = None,
+        max_results: int = 20
+    ) -> Dict[str, Any]:
+        """
+        Get events for today (00:00 to 23:59 Israel time).
+        
+        CRITICAL: Uses Asia/Jerusalem timezone, NOT UTC,
+        so Cloud Run (UTC) returns correct results for Israeli users.
+        
+        Args:
+            user_tokens: User's OAuth tokens
+            calendar_id: Calendar ID (default: primary)
+            user_id: User ID for auth cleanup on failure
+            max_results: Max events to return
+            
+        Returns:
+            Standard dict: {status, events} or {status, type, message}
+        """
+        service, error = self._get_calendar_service(user_tokens, user_id)
+        
+        if service is None:
+            if error == ERROR_AUTH_REQUIRED:
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Failed to connect", "events": []}
+        
+        try:
+            # Calculate today's boundaries in Israel timezone
+            now_israel = datetime.now(ISRAEL_TZ)
+            today_start = datetime.combine(now_israel.date(), time.min, tzinfo=ISRAEL_TZ)
+            today_end = datetime.combine(now_israel.date(), time(23, 59, 59), tzinfo=ISRAEL_TZ)
+            
+            time_min = today_start.isoformat()
+            time_max = today_end.isoformat()
+            
+            print(f"[Calendar] Fetching today's events: {time_min} → {time_max}")
+            
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min,
+                timeMax=time_max,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute()
+            
+            events = events_result.get("items", [])
+            print(f"[Calendar] Found {len(events)} events for today")
+            return {"status": "success", "events": events}
+            
+        except HttpError as e:
+            print(f"[Calendar] HTTP Error: {e}")
+            if e.resp.status in [401, 403]:
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Calendar API error", "events": []}
+            
+        except RefreshError as e:
+            print(f"[Calendar] ⚠️ RefreshError: {e}")
+            if user_id:
+                self._clear_user_credentials(user_id)
+            return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            print(f"[Calendar] Error fetching today's events: {e}")
+            if self._is_auth_error(error_str):
+                print(f"[Calendar] ⚠️ Detected auth error: {e}")
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Error fetching events", "events": []}
+    
+    def format_today_events(self, events: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Format raw Google Calendar events into a pretty briefing string.
+        
+        Format per event:
+            {emoji} *{summary}* | {start} - {end}
+        
+        Args:
+            events: List of Google Calendar event dicts
+            
+        Returns:
+            Formatted string, or None if no events
+        """
+        if not events:
+            return None
+        
+        lines = []
+        for event in events:
+            summary = event.get("summary", "אירוע ללא שם")
+            color_id = event.get("colorId", "")
+            emoji = COLOR_ID_EMOJI.get(str(color_id), DEFAULT_EVENT_EMOJI)
+            
+            # Parse start/end times
+            start_raw = event.get("start", {})
+            end_raw = event.get("end", {})
+            
+            if "dateTime" in start_raw:
+                # Timed event
+                start_dt = datetime.fromisoformat(start_raw["dateTime"])
+                end_dt = datetime.fromisoformat(end_raw.get("dateTime", start_raw["dateTime"]))
+                start_str = start_dt.strftime("%H:%M")
+                end_str = end_dt.strftime("%H:%M")
+                lines.append(f"{emoji} *{summary}* | {start_str} - {end_str}")
+            elif "date" in start_raw:
+                # All-day event
+                lines.append(f"{emoji} *{summary}* | כל היום")
+        
+        if not lines:
+            return None
+        
+        return "\n\n".join(lines)
 
 
 # Singleton instance

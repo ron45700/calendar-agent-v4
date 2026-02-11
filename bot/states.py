@@ -34,6 +34,9 @@ class OnboardingStates(StatesGroup):
     # Step 5b: Daily check time selection
     WAITING_FOR_DAILY_TIME = State()
     
+    # Step 5c: Daily briefing toggle
+    WAITING_FOR_DAILY_BRIEFING = State()
+    
     # Step 6: User defines color preferences
     WAITING_FOR_COLORS = State()
     

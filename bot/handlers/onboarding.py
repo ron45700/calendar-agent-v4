@@ -2,7 +2,7 @@
 Onboarding FSM handlers for Agentic Calendar 2.0
 Multi-step conversational questionnaire for new user setup.
 
-Flow: Confirmation → Nickname → Agent Name → Gender → Reminders → Daily Check → Colors → Contacts → Complete
+Flow: Confirmation → Nickname → Agent Name → Gender → Reminders → Daily Check → Daily Briefing → Colors → Contacts → Complete
 """
 
 from typing import Optional
@@ -12,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 
 from models.user import UserData
 from services.firestore_service import firestore_service
+from services.calendar_service import calendar_service
 from bot.states import OnboardingStates
 from bot.keyboards import (
     get_gender_keyboard,
@@ -284,9 +285,9 @@ async def onboarding_daily_check(callback: CallbackQuery, state: FSMContext) -> 
         # Edit message
         await callback.message.edit_text("בדיקה יומית: לא ❌")
         
-        # Move to colors step
-        await state.set_state(OnboardingStates.WAITING_FOR_COLORS)
-        await send_colors_prompt(callback.message)
+        # Move to daily briefing step
+        await state.set_state(OnboardingStates.WAITING_FOR_DAILY_BRIEFING)
+        await send_daily_briefing_prompt(callback.message)
 
 
 @router.callback_query(OnboardingStates.WAITING_FOR_DAILY_TIME, F.data.startswith("daily_time_"))
@@ -308,6 +309,75 @@ async def onboarding_daily_time(callback: CallbackQuery, state: FSMContext) -> N
         hour = int(time_data)
         await state.update_data(enable_daily_check=True, daily_check_hour=hour)
         await callback.message.edit_text(f"⏰ בדיקה יומית: {hour:02d}:00 ✅")
+    
+    # Move to daily briefing step
+    await state.set_state(OnboardingStates.WAITING_FOR_DAILY_BRIEFING)
+    await send_daily_briefing_prompt(callback.message)
+
+
+async def send_daily_briefing_prompt(message) -> None:
+    """Helper to send the daily briefing question."""
+    await message.answer(
+        "☕ *עוד משהו קטן* -\n"
+        "בא לך שאשלח לך כל בוקר ב-8:00 הודעה מתומצת עם הל\"\u05d6 להיום? \u2600\ufe0f",
+        parse_mode="Markdown",
+        reply_markup=get_yes_no_keyboard("daily_briefing")
+    )
+
+
+@router.callback_query(OnboardingStates.WAITING_FOR_DAILY_BRIEFING, F.data.startswith("daily_briefing_"))
+async def onboarding_daily_briefing(callback: CallbackQuery, state: FSMContext) -> None:
+    """
+    Step 5c: Enable/disable daily morning briefing.
+    If enabled, shows instant preview of today's schedule.
+    """
+    enable = callback.data == "daily_briefing_yes"
+    
+    await callback.answer()
+    await state.update_data(daily_briefing=enable)
+    
+    if enable:
+        await callback.message.edit_text("דיווח יומי: כן ✅")
+        
+        # INSTANT GRATIFICATION: Show today's schedule as a preview
+        # Get user tokens for the preview
+        user_id = callback.from_user.id
+        user_data = firestore_service.get_user(user_id)
+        
+        if user_data:
+            calendar_config = user_data.get("calendar_config", {})
+            refresh_token = calendar_config.get("refresh_token")
+            
+            if refresh_token:
+                user_tokens = {
+                    "access_token": calendar_config.get("access_token"),
+                    "refresh_token": refresh_token
+                }
+                
+                try:
+                    result = calendar_service.get_today_events(
+                        user_tokens=user_tokens,
+                        user_id=str(user_id)
+                    )
+                    
+                    if result.get("status") == "success":
+                        formatted = calendar_service.format_today_events(result.get("events", []))
+                        if formatted:
+                            await callback.message.answer(
+                                "מעולה! הנה דוגמה למה שתקבל ממני כל בוקר: \u2600\ufe0f\n\n"
+                                f"{formatted}",
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            await callback.message.answer(
+                                "✅ הדיווח היומי הופעל!\n"
+                                "אין לך אירועים היום, אבל מחר תתחיל לקבל דיווחים! \ud83d\udcc5"
+                            )
+                except Exception as e:
+                    print(f"[Onboarding] Briefing preview failed: {e}")
+                    await callback.message.answer("✅ הדיווח היומי הופעל!")
+    else:
+        await callback.message.edit_text("דיווח יומי: לא ❌")
     
     # Move to colors step
     await state.set_state(OnboardingStates.WAITING_FOR_COLORS)
@@ -422,6 +492,7 @@ async def onboarding_contacts(message: Message, state: FSMContext) -> None:
         "calendar_config.daily_check_hour": daily_check_hour,
         "calendar_config.color_map": color_map,
         "contacts": contacts_data,
+        "preferences.daily_briefing": data.get("daily_briefing", False),
         "onboarding_completed": True
     })
     
