@@ -38,8 +38,11 @@ Classify the user's intent and extract relevant structured data.
 **⚠️ Important:** If time and subject are provided - extract them as summary/start_time for backup event creation!
 
 ### 3. `daily_check_setup` - Daily Check-In (In Development)
-**When:** User wants you to ask them something every day.
-**Keywords:** "כל יום", "תבדוק איתי", "תשאל אותי"
+**When:** User wants you to CHECK IN / ASK them something every day.
+**Keywords:** "תבדוק איתי", "תשאל אותי"
+**⚠️ NOT this intent:** If the user asks for a MORNING SCHEDULE/BRIEFING
+  ("הלו"ז כל בוקר", "דיווח יומי", "תשלח לי כל בוקר"),
+  classify as `edit_preferences` with `daily_briefing: true`.
 **⚠️ Important:** Extract details in case we can create backup events.
 
 ### 4. `edit_preferences` - Change Settings
@@ -71,6 +74,30 @@ If the intent is `set_reminder` or `daily_check_setup` **AND** the user provided
 1. **Exact match only** - Only use names from the contacts list
 2. **Do not guess** - If name is not in the list, use it exactly as the user said
 3. **No fuzzy matching** - "רווח" ≠ "רועי", "דן" ≠ "דניאל"
+
+---
+
+## ATTENDEE EXTRACTION RULES (CRITICAL)
+
+`attendees[]` = people who should receive a **Google Calendar invitation email**.
+A name in the event title is NOT automatically an attendee.
+
+**Populate `attendees[]` ONLY when:**
+- User uses an inviting verb: "תזמין את", "עם" (in meeting context), "שלח ל"
+- The person should clearly RECEIVE an invitation
+
+**Keep name in `summary` only (do NOT add to attendees) when:**
+- Part of the title: "יום הולדת של נועם"
+- Possessive: "השיעור של מיכל"
+- Subject-of: "פגישה על הפרויקט של דני"
+
+---
+
+## COLOR HIERARCHY (Strict Order)
+
+1. **Explicit request** — User says "באדום", "ירוק" → set `color_name` + `color_name_hebrew`
+2. **No mention** — Leave `color_name` empty. Handler resolves from category/prefs.
+3. **Never guess** — If user doesn't mention a color, do NOT set `color_name`.
 
 ---
 
@@ -153,6 +180,21 @@ If the intent is `set_reminder` or `daily_check_setup` **AND** the user provided
 {{"intent": "get_events", "response_text": "בודק מה יש לך מחר... 📋", "payload": {{"time_range": "tomorrow"}}}}
 ```
 
+**User:** "בא לי לקבל כל בוקר את הלו"ז שלי"
+```json
+{{"intent": "edit_preferences", "response_text": "הופעל! ☀️ מחר ב-8:00 תקבל סיכום של הלו\"ז שלך.", "payload": {{"daily_briefing": true}}}}
+```
+
+**User:** "יום הולדת לנועם ביום שישי ב-18:00"
+```json
+{{"intent": "create_event", "response_text": "סגור! 🎉 יום הולדת לנועם נקבע ליום שישי ב-18:00.", "payload": {{"summary": "יום הולדת לנועם", "start_time": "2026-02-13T18:00:00+02:00", "end_time": "2026-02-13T19:00:00+02:00", "category": "personal"}}}}
+```
+
+**User:** "שים אירוע ירוק מחר ב-14:00 - פרויקט"
+```json
+{{"intent": "create_event", "response_text": "בוצע! 💚 פרויקט נקבע למחר ב-14:00 בירוק.", "payload": {{"summary": "פרויקט", "start_time": "2026-02-13T14:00:00+02:00", "end_time": "2026-02-13T15:00:00+02:00", "category": "work", "color_name": "basil", "color_name_hebrew": "ירוק"}}}}
+```
+
 ---
 
 Remember: Always return valid JSON. If unsure, use intent `chat`.
@@ -193,8 +235,17 @@ INTENT_FUNCTION_SCHEMA = {
                     },
                     "category": {
                         "type": "string",
-                        "enum": ["work", "meeting", "personal", "sport", "study", "health", "family", "fun", "other"],
-                        "description": "Event category for color coding"
+                        "enum": ["work", "meeting", "personal", "sport", "study", "health", "family", "fun", "general"],
+                        "description": "Event category. Use 'general' if no specific match. Do NOT guess."
+                    },
+                    "color_name": {
+                        "type": "string",
+                        "enum": ["lavender", "sage", "grape", "flamingo", "banana", "tangerine", "peacock", "graphite", "blueberry", "basil", "tomato"],
+                        "description": "ONLY set when user EXPLICITLY requests a color. Overrides category default."
+                    },
+                    "color_name_hebrew": {
+                        "type": "string",
+                        "description": "Hebrew name of the explicit color for confirmation message (e.g. 'ירוק', 'אדום')"
                     },
                     "location": {"type": "string", "description": "Event location"},
                     "description": {"type": "string", "description": "Event description"},
@@ -219,6 +270,10 @@ INTENT_FUNCTION_SCHEMA = {
                         "type": "object",
                         "description": "Contact name-email mappings",
                         "additionalProperties": {"type": "string"}
+                    },
+                    "daily_briefing": {
+                        "type": "boolean",
+                        "description": "Enable/disable daily morning briefing"
                     },
                     
                     # Get events fields

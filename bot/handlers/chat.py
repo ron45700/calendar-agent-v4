@@ -5,6 +5,7 @@ Uses LLM intent classification for intelligent routing.
 
 Supports intents:
 - create_event: Calendar events
+- get_events: Query calendar / check schedule
 - set_reminder: Quick pings/reminders
 - reschedule_event: Move/postpone events
 - edit_preferences: Settings changes
@@ -13,6 +14,7 @@ Supports intents:
 
 import os
 import sys
+import asyncio
 import tempfile
 import random
 import logging
@@ -28,6 +30,7 @@ from services.llm_service import llm_service
 from services.firestore_service import firestore_service
 from bot.utils import get_random_thinking_phrase, get_formatted_current_time
 from bot.handlers.events import process_create_event
+from services.calendar_service import calendar_service
 from utils.performance import measure_time
 
 
@@ -157,8 +160,8 @@ async def handle_voice_message(message: Message, user: Optional[UserData], bot: 
     
     status_msg = await message.answer("🎙️ מתמלל את ההודעה הקולית...")
     
+    # --- Phase 1: Download & Transcribe ---
     try:
-        # Download and transcribe
         logger.info(f"[Voice] Downloading voice file for user {user_id}")
         voice = message.voice
         file = await bot.get_file(voice.file_id)
@@ -178,26 +181,40 @@ async def handle_voice_message(message: Message, user: Optional[UserData], bot: 
         except:
             pass
         
+    except Exception as e:
+        logger.error(f"❌ [Voice] Transcription failed: {e}")
+        import traceback
+        traceback.print_exc()
+        await message.answer("❌ שגיאה בתמלול ההודעה הקולית.\nנסה שוב או שלח הודעת טקסט.")
+        return
+    
+    # --- Phase 2: Display & Process ---
+    try:
         # Save to history
         logger.info(f"[Firestore] Saving user message to history")
         firestore_service.save_message(user_id, "user", transcribed_text, {"voice": True})
         
-        # Update status
+        # Escape Markdown special chars in transcription for safe display
+        safe_text = transcribed_text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
         thinking_phrase = get_random_thinking_phrase()
-        await status_msg.edit_text(
-            f"🎙️ שמעתי: _{transcribed_text}_\n\n💭 {thinking_phrase}",
-            parse_mode="Markdown"
-        )
+        try:
+            await status_msg.edit_text(
+                f"🎙️ שמעתי: _{safe_text}_\n\n💭 {thinking_phrase}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            # Fallback: send without Markdown if escaping still fails
+            await status_msg.edit_text(f"🎙️ שמעתי: {transcribed_text}\n\n💭 {thinking_phrase}")
         
         # Process intent
         logger.info(f"[Intent] Processing user intent...")
         await process_user_intent(message, user, state, transcribed_text, user_id)
         
     except Exception as e:
-        logger.error(f"❌ [Voice] Error: {e}")
+        logger.error(f"❌ [Voice] Intent processing error: {e}")
         import traceback
         traceback.print_exc()
-        await message.answer("❌ שגיאה בעיבוד ההודעה הקולית.\nנסה שוב או שלח הודעת טקסט.")
+        await message.answer("❌ שגיאה בעיבוד ההודעה.\nנסה שוב בבקשה.")
 
 
 # =============================================================================
@@ -342,6 +359,55 @@ async def process_user_intent(
         logger.info(f"[Routing] -> create_event")
         await process_create_event(message, user, state, payload, response_text)
     
+    elif intent == "get_events":
+        logger.info(f"[Routing] -> get_events")
+        
+        # Get user tokens
+        tokens = user.get("calendar_config", {})
+        time_range = payload.get("time_range", "today")
+        
+        try:
+            # Fetch events with timeout protection
+            if time_range == "today":
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda: calendar_service.get_today_events(tokens, user_id=str(user_id))
+                    ), timeout=10
+                )
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda: calendar_service.get_upcoming_events(tokens, max_results=10, user_id=str(user_id))
+                    ), timeout=10
+                )
+            
+            if result.get("status") != "success":
+                error_type = result.get("type", "")
+                if error_type == "auth_required":
+                    events_response = "🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש."
+                else:
+                    events_response = "❌ שגיאה בגישה ליומן. נסה שוב בעוד כמה דקות."
+            else:
+                events = result.get("events", [])
+                formatted = calendar_service.format_today_events(events)
+                if formatted:
+                    range_label = "היום" if time_range == "today" else "הקרובים"
+                    events_response = f"📅 *האירועים שלך ל{range_label}:*\n\n{formatted}"
+                else:
+                    events_response = "📅 אין אירועים מתוכננים! 🎉\nהיום שלך פנוי."
+        
+        except asyncio.TimeoutError:
+            logger.error(f"❌ [Calendar] Timeout fetching events for user {user_id}")
+            events_response = "⏳ Google Calendar לא הגיב בזמן.\nנסה שוב בעוד רגע."
+        except Exception as e:
+            logger.error(f"❌ [Calendar] Error fetching events: {e}")
+            import traceback
+            traceback.print_exc()
+            events_response = "❌ שגיאה בשליפת האירועים. נסה שוב."
+        
+        firestore_service.save_message(user_id, "assistant", events_response)
+        await message.answer(events_response, parse_mode="Markdown")
+    
     elif intent == "set_reminder":
         logger.info(f"[Routing] -> set_reminder")
         reminder_text = payload.get("reminder_text", "משהו")
@@ -377,10 +443,63 @@ async def process_user_intent(
     elif intent == "edit_preferences":
         logger.info(f"[Routing] -> edit_preferences")
         
-        prefs_response = (
-            f"⚙️ אני רואה שאתה רוצה לשנות הגדרות.\n\n"
-            f"שלח /settings לעדכון ההגדרות."
-        )
+        # --- Fix #1: Smart Routing — process payload directly ---
+        handled = False
+        
+        # Daily briefing toggle
+        if "daily_briefing" in payload:
+            new_value = bool(payload["daily_briefing"])
+            firestore_service.update_user(user_id, {
+                "preferences.daily_briefing": new_value
+            })
+            status_text = "מופעל ☀️" if new_value else "כבוי 🌙"
+            prefs_response = f"✅ דיווח יומי עודכן: **{status_text}**"
+            if new_value:
+                prefs_response += "\nמחר ב-08:00 תקבל ממני סיכום של הלו\"ז שלך!"
+            handled = True
+        
+        # Nickname change
+        elif payload.get("nickname"):
+            new_nick = payload["nickname"]
+            firestore_service.update_user(user_id, {
+                "personal_info.nickname": new_nick
+            })
+            prefs_response = f"✅ עודכן! מעכשיו אתה *{new_nick}* 🔥"
+            handled = True
+        
+        # Agent name change
+        elif payload.get("agent_name"):
+            new_name = payload["agent_name"]
+            firestore_service.update_user(user_id, {
+                "personal_info.bot_name": new_name
+            })
+            prefs_response = f"✅ אתחול מערכות... 🤖 נעים מאוד, אני *{new_name}*!"
+            handled = True
+        
+        # Colors update
+        elif payload.get("colors"):
+            color_updates = payload["colors"]
+            update_dict = {f"calendar_config.color_map.{cat}": color for cat, color in color_updates.items()}
+            firestore_service.update_user(user_id, update_dict)
+            prefs_response = "✅ צבעים עודכנו! 🎨"
+            handled = True
+        
+        # Contacts update
+        elif payload.get("contacts"):
+            contact_updates = payload["contacts"]
+            update_dict = {f"contacts.{name}": email for name, email in contact_updates.items()}
+            firestore_service.update_user(user_id, update_dict)
+            names = ", ".join(contact_updates.keys())
+            prefs_response = f"✅ {names} נוספו לאנשי הקשר! 📇"
+            handled = True
+        
+        if not handled:
+            # Fallback: no specific payload, redirect to settings
+            prefs_response = response_text if response_text else (
+                f"⚙️ אני רואה שאתה רוצה לשנות הגדרות.\n\n"
+                f"שלח /settings לעדכון ההגדרות."
+            )
+        
         logger.info(f"[Firestore] Saving assistant response")
         firestore_service.save_message(user_id, "assistant", prefs_response)
         

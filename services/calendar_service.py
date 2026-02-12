@@ -47,6 +47,7 @@ CATEGORY_COLOR_MAP = {
     "sport": 6,         # Tangerine
     "study": 3,         # Grape
     "fun": 11,          # Tomato
+    "general": 7,       # Peacock (Cyan) - default fallback
     "other": 8          # Graphite
 }
 

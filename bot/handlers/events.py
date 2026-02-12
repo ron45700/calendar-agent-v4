@@ -181,12 +181,22 @@ async def create_event_from_payload(
         resolved = resolve_attendee_emails(attendee_names, user_contacts)
         payload["resolved_attendees"] = resolved
     
-    # Get color ID for category
-    category = payload.get("category", "other")
+    # Color hierarchy (Fix #4): Explicit Name > Payload ID > Category Default
+    category = payload.get("category", "general")
     color_map = user.get("calendar_config", {}).get("color_map", {})
+    color_name = payload.get("color_name")
+    color_id = None
     
-    # Check if payload already has color_id from LLM
-    color_id = payload.get("color_id")
+    # 1. Explicit color name from LLM (highest priority)
+    if color_name:
+        from services.calendar_service import COLOR_NAME_MAP
+        color_id = COLOR_NAME_MAP.get(color_name)
+    
+    # 2. Fallback to payload color_id
+    if not color_id:
+        color_id = payload.get("color_id")
+    
+    # 3. Fallback to category/user-prefs default
     if not color_id:
         color_id = calendar_service.get_color_id_for_category(category, color_map)
     
@@ -266,6 +276,53 @@ async def handle_missing_contact_email(
     
     # Save this message to history
     firestore_service.save_message(user_id, "user", email)
+    
+    # --- CANCEL vs SKIP detection (strict separation) ---
+    CANCEL_PHRASES = {"בטל", "בטל אירוע", "עזוב", "לא משנה", "תעצור", "cancel", "stop", "abort"}
+    SKIP_PHRASES = {"לא צריך", "בלי הזמנה", "בלי", "בלעדיו", "רק תרשום", "דלג", "תדלג", "skip", "no invite", "without email", "no need", "לא"}
+    text_lower = email.lower().strip()
+    
+    # CANCEL → Abort entire event creation
+    if text_lower in CANCEL_PHRASES:
+        await state.clear()
+        cancel_msg = "❌ האירוע בוטל."
+        firestore_service.save_message(user_id, "assistant", cancel_msg)
+        await message.answer(cancel_msg)
+        return
+    
+    # SKIP → Drop this invite, still create the event
+    if text_lower in SKIP_PHRASES:
+        data = await state.get_data()
+        pending_event = data.get("pending_event", {})
+        missing_name = data.get("missing_contact_name", "")
+        remaining = data.get("remaining_missing", [])
+        original_response = data.get("original_response", "")
+        
+        # Remove skipped attendee
+        attendees = pending_event.get("attendees", [])
+        pending_event["attendees"] = [a for a in attendees if a != missing_name]
+        
+        skip_msg = f"👌 סבבה, יוצר בלי הזמנה ל{missing_name}."
+        firestore_service.save_message(user_id, "assistant", skip_msg)
+        await message.answer(skip_msg)
+        
+        if remaining:
+            next_missing = remaining[0]
+            await state.update_data(
+                pending_event=pending_event,
+                missing_contact_name=next_missing,
+                remaining_missing=remaining[1:]
+            )
+            ask_msg = f"👤 מה המייל של *{next_missing}*?"
+            firestore_service.save_message(user_id, "assistant", ask_msg)
+            await message.answer(ask_msg, parse_mode="Markdown")
+            return
+        
+        # All done — create event without the skipped invite
+        await state.clear()
+        fresh_user = firestore_service.get_user(user_id) or user
+        await create_event_from_payload(message, fresh_user, pending_event, original_response)
+        return
     
     # Validate email format
     if not is_valid_email(email):

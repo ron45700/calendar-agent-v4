@@ -25,6 +25,22 @@ from bot.keyboards import (
 # Create router for onboarding handlers
 router = Router(name="onboarding_router")
 
+# Cancel/exit keywords for FSM escape
+CANCEL_KEYWORDS = {"בטל", "ביטול", "עצור", "עזוב", "cancel", "stop", "exit", "quit"}
+
+
+async def is_cancel_request(message: Message, state: FSMContext) -> bool:
+    """Check if user wants to cancel the onboarding flow."""
+    text = (message.text or "").strip().lower()
+    if text in CANCEL_KEYWORDS:
+        await state.clear()
+        await message.answer(
+            "❌ ההגדרות בוטלו.\n"
+            "אפשר להתחיל מחדש בכל עת עם /settings"
+        )
+        return True
+    return False
+
 
 # =============================================================================
 # Onboarding Trigger (from commands.py callback OR keyword)
@@ -135,6 +151,10 @@ async def onboarding_nickname(message: Message, state: FSMContext) -> None:
     """
     nickname = message.text.strip()
     
+    # Check for cancel
+    if await is_cancel_request(message, state):
+        return
+    
     if not nickname or len(nickname) > 50:
         await message.answer(
             "❌ אופס, השם ארוך מדי או ריק.\n"
@@ -165,6 +185,10 @@ async def onboarding_agent_name(message: Message, state: FSMContext) -> None:
     Step 2: Capture agent's nickname preference.
     """
     agent_name = message.text.strip()
+    
+    # Check for cancel
+    if await is_cancel_request(message, state):
+        return
     
     if not agent_name or len(agent_name) > 50:
         await message.answer("❌ השם ארוך מדי או ריק. נסה שוב:")
@@ -410,6 +434,10 @@ async def onboarding_colors(message: Message, state: FSMContext) -> None:
     """
     text = message.text.strip()
     
+    # Check for cancel
+    if await is_cancel_request(message, state):
+        return
+    
     if text.lower() in ["דלג", "skip", "לדלג"]:
         await state.update_data(colors_raw="")
         await message.answer("✅ דילגת על צבעים")
@@ -444,6 +472,10 @@ async def onboarding_contacts(message: Message, state: FSMContext) -> None:
     """
     text = message.text.strip()
     user_id = message.from_user.id
+    
+    # Check for cancel
+    if await is_cancel_request(message, state):
+        return
     
     # Parse contacts or skip
     contacts = {}

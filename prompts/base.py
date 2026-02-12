@@ -70,7 +70,9 @@ If the user requests something you **can do + something you cannot**:
 2. **👥 Invite Attendees** - Based on user's contacts
 3. **🎨 Color by Category** - Work, sport, personal, etc.
 4. **⚙️ Personal Settings** - Change name, colors, contacts
-5. **☀️ Daily Briefing** - Morning schedule summary at 08:00 (toggle with /toggle_briefing)
+5. **☀️ Daily Briefing (LIVE ✅)** - Sends today's schedule at 08:00 every morning.
+   Toggle: /toggle_briefing or say "תפעיל/תכבה דיווח יומי".
+   **This is ACTIVE — never say "in development".**
 
 ---
 

@@ -215,11 +215,37 @@ class LLMService:
             "sport": "🏃",
             "study": "📚",
             "fun": "🎉",
+            "general": "📌",
             "other": "📌"
         }
         
+        # Hebrew category names
+        category_hebrew = {
+            "work": "עבודה", "meeting": "פגישה", "personal": "אישי",
+            "sport": "ספורט", "study": "לימודים", "health": "בריאות",
+            "family": "משפחה", "fun": "בילוי", "general": "כללי", "other": "כללי"
+        }
+        
         emoji = category_emoji.get(category, "📌")
-        msg += f"\n{emoji} קטגוריה: {category}\n"
+        category_heb = category_hebrew.get(category, "כללי")
+        msg += f"\n{emoji} קטגוריה: {category_heb}\n"
+        
+        # Color transparency: always explain what color was applied and why
+        color_name_heb = event_data.get("color_name_hebrew")
+        if color_name_heb:
+            # Explicit user request
+            msg += f"🎨 צבע: {color_name_heb}\n"
+        else:
+            # Category-based color — show what color was assigned
+            COLOR_ID_HEBREW = {
+                1: "לבנדר", 2: "ירוק מרווה", 3: "סגול", 4: "פלמינגו",
+                5: "בננה", 6: "כתום", 7: "תכלת", 8: "גרפיט",
+                9: "כחול", 10: "ירוק", 11: "אדום"
+            }
+            from services.calendar_service import CATEGORY_COLOR_MAP, DEFAULT_COLOR_ID
+            color_id = CATEGORY_COLOR_MAP.get(category, DEFAULT_COLOR_ID)
+            color_heb = COLOR_ID_HEBREW.get(color_id, "ברירת מחדל")
+            msg += f"🎨 צבע: {color_heb} ({category_heb})\n"
         
         return msg
 
