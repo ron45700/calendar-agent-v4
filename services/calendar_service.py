@@ -497,6 +497,229 @@ class CalendarService:
         # Fall back to default mapping
         return CATEGORY_COLOR_MAP.get(category, DEFAULT_COLOR_ID)
     
+    # =========================================================================
+    # Search Events (for Update / Delete flows)
+    # =========================================================================
+    
+    def search_events(
+        self,
+        user_tokens: Dict[str, str],
+        query: str,
+        time_min: Optional[str] = None,
+        time_max: Optional[str] = None,
+        max_results: int = 10,
+        calendar_id: str = "primary",
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Search user's calendar for events matching a query string or time range.
+        
+        Uses Google Calendar's native 'q' parameter for text search,
+        then applies local fuzzy matching for better Hebrew support.
+        
+        Args:
+            user_tokens: User's OAuth tokens
+            query: Search text (event title / keyword)
+            time_min: ISO 8601 lower bound (default: now)
+            time_max: ISO 8601 upper bound (default: 30 days from now)
+            max_results: Max events to return
+            calendar_id: Calendar ID (default: primary)
+            user_id: User ID for auth cleanup on failure
+            
+        Returns:
+            {status: "success", events: [...]} or error dict
+        """
+        service, error = self._get_calendar_service(user_tokens, user_id)
+        
+        if service is None:
+            if error == ERROR_AUTH_REQUIRED:
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Failed to connect", "events": []}
+        
+        try:
+            # Default time window: now → 30 days ahead
+            if not time_min:
+                now_israel = datetime.now(ISRAEL_TZ)
+                # Search from start of today so we catch same-day events
+                today_start = datetime.combine(now_israel.date(), time.min, tzinfo=ISRAEL_TZ)
+                time_min = today_start.isoformat()
+            if not time_max:
+                now_israel = datetime.now(ISRAEL_TZ)
+                future = now_israel + timedelta(days=30)
+                time_max = future.isoformat()
+            
+            print(f"[Calendar] Searching events: q='{query}', {time_min} → {time_max}")
+            
+            # First: use Google's native text search (fast, server-side)
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                q=query,
+                timeMin=time_min,
+                timeMax=time_max,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute()
+            
+            events = events_result.get("items", [])
+            
+            # If Google's q param returned nothing, fall back to local fuzzy match
+            # (Google's q is weak with Hebrew partial matches)
+            if not events and query:
+                print(f"[Calendar] Google q search empty, trying local fuzzy match...")
+                all_result = service.events().list(
+                    calendarId=calendar_id,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    maxResults=50,
+                    singleEvents=True,
+                    orderBy="startTime"
+                ).execute()
+                
+                all_events = all_result.get("items", [])
+                query_lower = query.lower()
+                events = [
+                    e for e in all_events
+                    if query_lower in e.get("summary", "").lower()
+                ]
+            
+            print(f"[Calendar] Found {len(events)} matching events")
+            return {"status": "success", "events": events}
+            
+        except HttpError as e:
+            print(f"[Calendar] HTTP Error searching events: {e}")
+            if e.resp.status in [401, 403]:
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Calendar API error", "events": []}
+            
+        except RefreshError as e:
+            print(f"[Calendar] ⚠️ RefreshError searching events: {e}")
+            if user_id:
+                self._clear_user_credentials(user_id)
+            return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            print(f"[Calendar] Error searching events: {e}")
+            if self._is_auth_error(error_str):
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login", "events": []}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Error searching events", "events": []}
+    
+    # =========================================================================
+    # Update Event
+    # =========================================================================
+    
+    def update_event(
+        self,
+        user_tokens: Dict[str, str],
+        event_id: str,
+        updates: Dict[str, Any],
+        calendar_id: str = "primary",
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Update an existing event on user's Google Calendar.
+        
+        Uses PATCH semantics: only fields present in `updates` are changed.
+        
+        Supported update keys:
+            - summary: New event title
+            - start_time: New ISO 8601 start time
+            - end_time: New ISO 8601 end time
+            - location: New location
+            - description: New description
+            - color_id: New Google Calendar color ID (1-11)
+            - attendees: List of {email, displayName} dicts (replaces all)
+        
+        Args:
+            user_tokens: User's OAuth tokens
+            event_id: Google Calendar event ID to update
+            updates: Dict of fields to change
+            calendar_id: Calendar ID (default: primary)
+            user_id: User ID for auth cleanup on failure
+            
+        Returns:
+            {status: "success", event: updated_event} or error dict
+        """
+        service, error = self._get_calendar_service(user_tokens, user_id)
+        
+        if service is None:
+            if error == ERROR_AUTH_REQUIRED:
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Failed to connect"}
+        
+        try:
+            # Build patch body from updates dict
+            patch_body = {}
+            
+            if "summary" in updates:
+                patch_body["summary"] = updates["summary"]
+            
+            if "start_time" in updates:
+                is_all_day = updates.get("is_all_day", False)
+                patch_body["start"] = self._format_datetime(updates["start_time"], is_all_day)
+            
+            if "end_time" in updates:
+                is_all_day = updates.get("is_all_day", False)
+                patch_body["end"] = self._format_datetime(updates["end_time"], is_all_day)
+            
+            if "location" in updates:
+                patch_body["location"] = updates["location"]
+            
+            if "description" in updates:
+                patch_body["description"] = updates["description"]
+            
+            if "color_id" in updates:
+                patch_body["colorId"] = str(updates["color_id"])
+            
+            if "attendees" in updates:
+                patch_body["attendees"] = updates["attendees"]
+            
+            if not patch_body:
+                return {"status": "error", "type": ERROR_GENERIC, "message": "No valid fields to update"}
+            
+            print(f"[Calendar] Updating event {event_id}: {list(patch_body.keys())}")
+            
+            # Use patch() for partial update (not put() which replaces everything)
+            updated_event = service.events().patch(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body=patch_body,
+                sendUpdates="all" if "attendees" in updates else "none"
+            ).execute()
+            
+            print(f"[Calendar] ✅ Event updated: {updated_event.get('id')}")
+            return {"status": "success", "event": updated_event}
+            
+        except HttpError as e:
+            print(f"[Calendar] HTTP Error updating event: {e}")
+            if e.resp.status in [401, 403]:
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            if e.resp.status == 404:
+                return {"status": "error", "type": ERROR_GENERIC, "message": "Event not found"}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Calendar API error"}
+            
+        except RefreshError as e:
+            print(f"[Calendar] ⚠️ RefreshError updating event: {e}")
+            if user_id:
+                self._clear_user_credentials(user_id)
+            return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            print(f"[Calendar] Error updating event: {e}")
+            if self._is_auth_error(error_str):
+                if user_id:
+                    self._clear_user_credentials(user_id)
+                return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
+            return {"status": "error", "type": ERROR_GENERIC, "message": "Error updating event"}
+    
     def get_today_events(
         self,
         user_tokens: Dict[str, str],

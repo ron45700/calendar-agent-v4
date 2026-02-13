@@ -82,7 +82,18 @@ class LLMService:
         )
         
         # Combine: Personality + Router Logic
-        system_prompt = f"{base_prompt}\n\n---\n\n{router_prompt}"
+        # Extract color map safely (assuming user_data is available in this function's scope)
+        # If user_data isn't passed directly, use user.calendar_config.get("color_map", {}) depending on your user model
+        color_map = {}
+        if hasattr(user, "get"): # Dict access
+            color_map = user.get("calendar_config", {}).get("color_map", {})
+        elif hasattr(user, "calendar_config"): # Object access
+            color_map = user.calendar_config.get("color_map", {})
+            
+        colors_str = json.dumps(color_map, ensure_ascii=False) if color_map else "{}"
+
+        # Combine: Personality + Router Logic + Current Colors
+        system_prompt = f"{base_prompt}\n\n---\n\n{router_prompt}\n\n### CURRENT USER COLORS ###\n{colors_str}"
         
         # Build messages with history
         messages = []
