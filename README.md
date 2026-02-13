@@ -1,5 +1,7 @@
 # 📅 Agentic Calendar (Sochen Yoman)
 
+**Python** · **aiogram** · **Telegram** · **Google Calendar API** · **Firestore** · **OpenAI** · **Whisper** · **aiohttp** · **Docker** · **Cloud Run**
+
 **A Telegram bot that connects your Google Calendar with natural language.**  
 Speak or type in Hebrew (or English), and the bot creates events, invites contacts, shows your schedule, and manages preferences—powered by OpenAI intent classification and a Hebrew-first, casual persona.
 
