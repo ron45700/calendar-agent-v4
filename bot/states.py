@@ -95,6 +95,9 @@ class AdminTestStates(StatesGroup):
     Fully isolated from regular user flows.
     Requires password-protected entry.
     """
+    # Waiting for password when user asked to run tests (e.g. "בוא נריץ בדיקות")
+    WAITING_FOR_PASSWORD = State()
+    
     # Main menu - user selects test
     MAIN_MENU = State()
     

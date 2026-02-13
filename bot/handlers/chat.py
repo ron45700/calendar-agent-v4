@@ -544,6 +544,17 @@ async def process_user_intent(
         await message.answer(prefs_response, parse_mode="Markdown")
         logger.info(f"✅ [Telegram] Response sent!")
     
+    elif intent == "admin_test":
+        # User asked to run tests (e.g. "בוא נריץ בדיקות") — ask for password
+        logger.info(f"[Routing] -> admin_test (request password)")
+        if not ADMIN_TEST_ENABLED:
+            await message.answer("❌ סוויטת הבדיקות כרגע לא פעילה.")
+        else:
+            admin_msg = "לסוויטת הבדיקות רק האדמין יכול להיכנס, תוכיח שאתה אדמיני בכתיבת הססמא הסודית"
+            firestore_service.save_message(user_id, "assistant", admin_msg)
+            await message.answer(admin_msg)
+            await state.set_state(AdminTestStates.WAITING_FOR_PASSWORD)
+    
     else:
         # General chat
         logger.info(f"[Routing] -> chat (general)")

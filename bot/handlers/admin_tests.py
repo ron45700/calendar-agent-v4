@@ -29,7 +29,7 @@ from services.firestore_service import firestore_service
 from services.llm_service import llm_service
 from bot.handlers.events import create_event_from_payload, process_update_event, process_delete_event
 from bot.utils import get_formatted_current_time
-from config import ADMIN_TEST_ENABLED
+from config import ADMIN_TEST_ENABLED, ADMIN_PASSWORD
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,44 @@ async def handle_global_exit(message: Message, state: FSMContext):
     firestore_service.save_message(user_id, "assistant", exit_msg)
     await message.answer(exit_msg)
     logger.info(f"[AdminTest] User {user_id} exited admin test suite")
+
+
+# =============================================================================
+# Waiting for Password (after "בוא נריץ בדיקות" etc.)
+# =============================================================================
+
+@router.message(StateFilter(AdminTestStates.WAITING_FOR_PASSWORD))
+async def handle_admin_password(message: Message, state: FSMContext, user: Optional[UserData]):
+    """
+    User was asked to prove they are admin. Check password (case-insensitive).
+    Accept ADMIN_PASSWORD or 'cks' or 'bol'.
+    """
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+    firestore_service.save_message(user_id, "user", text)
+    
+    allowed = [ADMIN_PASSWORD, "cks", "bol"]
+    if text.lower() in [p.lower() for p in allowed]:
+        await state.set_state(AdminTestStates.MAIN_MENU)
+        menu_msg = (
+            "🧪 *Admin Test Suite*\n\n"
+            "בחר בדיקה:\n"
+            "1️⃣ CRUD Obstacle Course\n"
+            "2️⃣ Onboarding Simulation\n"
+            "3️⃣ Voice Loop\n"
+            "4️⃣ Search Loop\n"
+            "5️⃣ Dry-Run Event\n\n"
+            "לצאת: כתוב *צא* או *exit*"
+        )
+        firestore_service.save_message(user_id, "assistant", menu_msg)
+        await message.answer(menu_msg, parse_mode="Markdown")
+        logger.info(f"[AdminTest] User {user_id} entered admin test suite (password)")
+    else:
+        await state.clear()
+        fail_msg = "❌ סיסמה שגויה."
+        firestore_service.save_message(user_id, "assistant", fail_msg)
+        await message.answer(fail_msg)
+        logger.warning(f"[AdminTest] User {user_id} wrong password attempt")
 
 
 # =============================================================================

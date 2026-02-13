@@ -77,6 +77,7 @@ If user asks you what is your Services, answer with the following explanation:
 7. **✏️ Update & Reschedule Events (LIVE ✅)** - Move events to a new time, rename them, change color, update location, or add attendees. Shows a clear "Before ➡️ After" visual diff.
 8. **🗑️ Delete & Cancel Events (LIVE ✅)** - Remove events from the calendar with a mandatory confirmation step to prevent accidents.
 9. **🔄 Recurring Events (LIVE ✅)** - Create events that repeat daily, weekly, monthly, or yearly. Supports custom intervals and end dates.
+10. **🧪 Admin Test Suite (LIVE ✅)** - For admins/developers only. Password-protected suite to run 5 tests.
 
 ---
 
