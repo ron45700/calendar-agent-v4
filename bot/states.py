@@ -67,3 +67,14 @@ class SettingsStates(StatesGroup):
     EDITING_PREFERENCES = State()
     EDITING_COLORS = State()
     EDITING_CONTACTS = State()
+
+
+class DeleteFlowStates(StatesGroup):
+    """
+    States for the event deletion confirmation flow.
+    Requires explicit user confirmation before deleting.
+    
+    Flow: User requests delete → Bot shows event + asks "בטוח?" → User confirms/cancels
+    """
+    # User must confirm or cancel the pending deletion
+    WAITING_FOR_DELETE_CONFIRM = State()

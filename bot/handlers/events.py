@@ -4,6 +4,8 @@ Handles calendar event creation from parsed intent payloads.
 """
 
 import re
+import asyncio
+from datetime import datetime
 from typing import Optional, Dict, List, Any
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
@@ -11,11 +13,39 @@ from aiogram.fsm.context import FSMContext
 
 from models.user import UserData
 from services.llm_service import llm_service
-from services.calendar_service import calendar_service, ERROR_AUTH_REQUIRED, ERROR_GENERIC
+from services.calendar_service import (
+    calendar_service, ERROR_AUTH_REQUIRED, ERROR_GENERIC,
+    CALENDAR_COLORS, COLOR_ID_EMOJI, DEFAULT_EVENT_EMOJI
+)
 from services.firestore_service import firestore_service
-from bot.states import EventFlowStates
+from bot.states import EventFlowStates, DeleteFlowStates
 from bot.utils import get_formatted_current_time
 from config import WEBAPP_URL
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Hebrew → Canonical Google Color Name Translation
+# =============================================================================
+# The LLM may output Hebrew color names or informal English.
+# This map normalizes them to the canonical CALENDAR_COLORS keys.
+
+HEBREW_COLOR_MAP = {
+    # Hebrew → canonical
+    "לבנדר": "lavender", "סגול בהיר": "lavender",
+    "ירוק מרווה": "sage", "מנטה": "sage",
+    "סגול": "grape", "סגול כהה": "grape",
+    "ורוד": "flamingo", "פלמינגו": "flamingo",
+    "צהוב": "banana", "בננה": "banana",
+    "כתום": "tangerine", "תפוז": "tangerine",
+    "תכלת": "peacock", "כחול בהיר": "peacock", "טורקיז": "peacock", "cyan": "peacock",
+    "אפור": "graphite", "גרפיט": "graphite",
+    "כחול": "blueberry", "כחול כהה": "blueberry", "blue": "blueberry",
+    "ירוק": "basil", "ירוק כהה": "basil", "green": "basil",
+    "אדום": "tomato", "אדום כהה": "tomato", "red": "tomato",
+}
 
 
 # Create router for event handlers
@@ -181,24 +211,40 @@ async def create_event_from_payload(
         resolved = resolve_attendee_emails(attendee_names, user_contacts)
         payload["resolved_attendees"] = resolved
     
-    # Color hierarchy (Fix #4): Explicit Name > Payload ID > Category Default
+    # Color hierarchy: Explicit Name > Payload ID > User Prefs > Default (Tangerine)
     category = payload.get("category", "general")
     color_map = user.get("calendar_config", {}).get("color_map", {})
     color_name = payload.get("color_name")
     color_id = None
+    color_source = "default"  # For debug logging
     
     # 1. Explicit color name from LLM (highest priority)
     if color_name:
-        from services.calendar_service import COLOR_NAME_MAP
-        color_id = COLOR_NAME_MAP.get(color_name)
+        # Normalize: try Hebrew→canonical translation, then direct lookup
+        canonical = HEBREW_COLOR_MAP.get(color_name, color_name)
+        color_id = CALENDAR_COLORS.get(canonical)
+        if color_id:
+            color_source = f"explicit '{color_name}' → '{canonical}' → {color_id}"
+        else:
+            logger.warning(f"[Color] Unknown color name '{color_name}' (canonical: '{canonical}')")
     
     # 2. Fallback to payload color_id
-    if not color_id:
+    if not color_id and payload.get("color_id"):
         color_id = payload.get("color_id")
+        color_source = f"payload color_id={color_id}"
     
-    # 3. Fallback to category/user-prefs default
+    # 3. Fallback to user's custom category preferences
+    if not color_id and color_map and category in color_map:
+        color_id = color_map[category]
+        color_source = f"user prefs '{category}' → {color_id}"
+    
+    # 4. Final fallback: default Tangerine (only if nothing else matched)
     if not color_id:
-        color_id = calendar_service.get_color_id_for_category(category, color_map)
+        from services.calendar_service import DEFAULT_COLOR_ID
+        color_id = DEFAULT_COLOR_ID
+        color_source = f"default Tangerine ({DEFAULT_COLOR_ID})"
+    
+    logger.info(f"[Color] Resolved: {color_source}")
     
     # Create event - pass user_id for auth cleanup on failure
     result = calendar_service.add_event(
@@ -421,3 +467,431 @@ async def cancel_event_creation(callback: CallbackQuery, state: FSMContext) -> N
     await callback.answer()
     await callback.message.edit_text("❌ האירוע בוטל.")
     await state.clear()
+
+
+# =============================================================================
+# Update Event Handler
+# =============================================================================
+
+# Helper: color ID → Hebrew name mapping
+COLOR_ID_HEBREW = {
+    1: "לבנדר", 2: "ירוק מרווה", 3: "סגול", 4: "פלמינגו",
+    5: "בננה", 6: "כתום", 7: "תכלת", 8: "גרפיט",
+    9: "כחול", 10: "ירוק", 11: "אדום"
+}
+
+# Helper: format a Google Calendar event datetime for display
+def _format_event_time(event: Dict[str, Any]) -> str:
+    """Format event start time for Hebrew display."""
+    start_raw = event.get("start", {})
+    if "dateTime" in start_raw:
+        dt = datetime.fromisoformat(start_raw["dateTime"])
+        day_names = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+        day_name = day_names[dt.weekday()]
+        return f"יום {day_name} {dt.strftime('%d/%m')} ב-{dt.strftime('%H:%M')}"
+    elif "date" in start_raw:
+        return "כל היום"
+    return "לא ידוע"
+
+
+async def process_update_event(
+    message: Message,
+    user: UserData,
+    state: FSMContext,
+    payload: Dict[str, Any],
+    response_text: str
+) -> None:
+    """
+    Process update_event intent: search → find → patch → show Before/After diff.
+    """
+    user_id = message.from_user.id
+    
+    # Get tokens
+    tokens = get_user_tokens(user)
+    if not tokens:
+        await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        return
+    
+    # Extract search hint
+    hint = payload.get("original_event_hint", "")
+    if not hint:
+        await message.answer("🤔 לא הבנתי איזה אירוע לעדכן. נסה שוב עם שם האירוע.")
+        return
+    
+    # Search for the event
+    logger.info(f"[Update] Searching for event: '{hint}'")
+    try:
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: calendar_service.search_events(
+                    tokens, query=hint, user_id=str(user_id)
+                )
+            ), timeout=10
+        )
+    except asyncio.TimeoutError:
+        await message.answer("⏳ Google Calendar לא הגיב בזמן. נסה שוב.")
+        return
+    except Exception as e:
+        logger.error(f"[Update] Search error: {e}")
+        await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
+        return
+    
+    if result.get("status") != "success":
+        if result.get("type") == ERROR_AUTH_REQUIRED:
+            await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        else:
+            await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
+        return
+    
+    events = result.get("events", [])
+    
+    # --- Handle match count ---
+    if len(events) == 0:
+        no_match_msg = (
+            f"לא מצאתי אירוע בשם '{hint}' ביומן שלך 🤔\n"
+            f"נסה לתת לי שם מדויק יותר או תאריך."
+        )
+        firestore_service.save_message(user_id, "assistant", no_match_msg)
+        await message.answer(no_match_msg)
+        return
+    
+    if len(events) > 1:
+        # Multiple matches — ask user to clarify
+        lines = ["מצאתי כמה אירועים שמתאימים:\n"]
+        for i, ev in enumerate(events[:5], 1):  # Cap at 5
+            summary = ev.get("summary", "ללא שם")
+            time_str = _format_event_time(ev)
+            lines.append(f"{i}️⃣ {summary} - {time_str}")
+        lines.append("\nאיזה מהם לעדכן?")
+        multi_msg = "\n".join(lines)
+        firestore_service.save_message(user_id, "assistant", multi_msg)
+        await message.answer(multi_msg)
+        return
+    
+    # --- Exactly 1 match: execute the update ---
+    target_event = events[0]
+    event_id = target_event.get("id")
+    old_summary = target_event.get("summary", "ללא שם")
+    old_time_str = _format_event_time(target_event)
+    old_color_id = target_event.get("colorId", "")
+    old_location = target_event.get("location", "")
+    
+    # Build updates dict for calendar_service.update_event
+    updates = {}
+    diff_lines = []  # For Before→After display
+    
+    # Title change
+    if payload.get("new_summary"):
+        updates["summary"] = payload["new_summary"]
+        diff_lines.append(
+            f"📝 שם האירוע:\n"
+            f"  ⬅️ {old_summary}\n"
+            f"  ➡️ {payload['new_summary']}"
+        )
+    
+    # Time change
+    if payload.get("new_start_time"):
+        updates["start_time"] = payload["new_start_time"]
+        if payload.get("new_end_time"):
+            updates["end_time"] = payload["new_end_time"]
+        # Format new time for display
+        try:
+            new_dt = datetime.fromisoformat(payload["new_start_time"])
+            day_names = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+            new_day = day_names[new_dt.weekday()]
+            new_time_str = f"יום {new_day} {new_dt.strftime('%d/%m')} ב-{new_dt.strftime('%H:%M')}"
+        except:
+            new_time_str = payload["new_start_time"]
+        
+        diff_lines.append(
+            f"⏰ מועד:\n"
+            f"  ⬅️ {old_time_str}\n"
+            f"  ➡️ {new_time_str}"
+        )
+    
+    # Color change
+    if payload.get("new_color_name"):
+        new_color_id = CALENDAR_COLORS.get(payload["new_color_name"])
+        if new_color_id:
+            updates["color_id"] = new_color_id
+            old_emoji = COLOR_ID_EMOJI.get(str(old_color_id), DEFAULT_EVENT_EMOJI)
+            new_emoji = COLOR_ID_EMOJI.get(str(new_color_id), DEFAULT_EVENT_EMOJI)
+            old_color_heb = COLOR_ID_HEBREW.get(int(old_color_id) if old_color_id else 0, "ברירת מחדל")
+            new_color_heb = payload.get("new_color_name_hebrew", COLOR_ID_HEBREW.get(new_color_id, "?"))
+            diff_lines.append(
+                f"🎨 צבע:\n"
+                f"  ⬅️ {old_emoji} {old_color_heb}\n"
+                f"  ➡️ {new_emoji} {new_color_heb}"
+            )
+    
+    # Location change
+    if payload.get("new_location"):
+        updates["location"] = payload["new_location"]
+        old_loc_display = old_location if old_location else "ללא מיקום"
+        diff_lines.append(
+            f"📍 מיקום:\n"
+            f"  ⬅️ {old_loc_display}\n"
+            f"  ➡️ {payload['new_location']}"
+        )
+    
+    # Attendees change
+    if payload.get("new_attendees"):
+        user_contacts = user.get("contacts", {})
+        resolved = resolve_attendee_emails(payload["new_attendees"], user_contacts)
+        if resolved:
+            # Merge with existing attendees
+            existing_attendees = target_event.get("attendees", [])
+            merged = list(existing_attendees)  # Keep existing
+            existing_emails = {a.get("email", "").lower() for a in existing_attendees}
+            for att in resolved:
+                if att["email"].lower() not in existing_emails:
+                    merged.append({"email": att["email"], "displayName": att.get("name", "")})
+            updates["attendees"] = merged
+            names = ", ".join(a.get("name", a["email"]) for a in resolved)
+            diff_lines.append(f"👥 משתתפים:\n  ➕ {names} נוסף/ו לאירוע")
+    
+    if not updates:
+        await message.answer("🤔 לא הבנתי מה לשנות. נסה לפרט מה לעדכן.")
+        return
+    
+    # Execute the update
+    logger.info(f"[Update] Patching event {event_id}: {list(updates.keys())}")
+    try:
+        update_result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: calendar_service.update_event(
+                    tokens, event_id=event_id, updates=updates, user_id=str(user_id)
+                )
+            ), timeout=10
+        )
+    except asyncio.TimeoutError:
+        await message.answer("⏳ Google Calendar לא הגיב בזמן. נסה שוב.")
+        return
+    except Exception as e:
+        logger.error(f"[Update] API error: {e}")
+        await message.answer("❌ שגיאה בעדכון האירוע. נסה שוב.")
+        return
+    
+    if update_result.get("status") != "success":
+        if update_result.get("type") == ERROR_AUTH_REQUIRED:
+            await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        else:
+            error_msg = update_result.get("message", "שגיאה לא ידועה")
+            await message.answer(f"❌ {error_msg}")
+        return
+    
+    # SUCCESS — build the Before→After diff message
+    diff_display = "\n\n".join(diff_lines)
+    success_msg = f"✅ האירוע עודכן בהצלחה!\n\n{diff_display}\n\nעוד שינוי? 😎"
+    
+    firestore_service.save_message(user_id, "assistant", success_msg)
+    await message.answer(success_msg)
+
+
+# =============================================================================
+# Delete Event Handler (Phase 1: Search + Confirm)
+# =============================================================================
+
+async def process_delete_event(
+    message: Message,
+    user: UserData,
+    state: FSMContext,
+    payload: Dict[str, Any],
+    response_text: str
+) -> None:
+    """
+    Process delete_event intent: search → find → ask confirmation → wait for FSM.
+    Does NOT delete immediately — enters WAITING_FOR_DELETE_CONFIRM state.
+    """
+    user_id = message.from_user.id
+    
+    # Get tokens
+    tokens = get_user_tokens(user)
+    if not tokens:
+        await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        return
+    
+    # Extract search hint
+    hint = payload.get("original_event_hint", "")
+    if not hint:
+        await message.answer("🤔 לא הבנתי איזה אירוע למחוק. נסה שוב עם שם האירוע.")
+        return
+    
+    # Search for the event
+    logger.info(f"[Delete] Searching for event: '{hint}'")
+    try:
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: calendar_service.search_events(
+                    tokens, query=hint, user_id=str(user_id)
+                )
+            ), timeout=10
+        )
+    except asyncio.TimeoutError:
+        await message.answer("⏳ Google Calendar לא הגיב בזמן. נסה שוב.")
+        return
+    except Exception as e:
+        logger.error(f"[Delete] Search error: {e}")
+        await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
+        return
+    
+    if result.get("status") != "success":
+        if result.get("type") == ERROR_AUTH_REQUIRED:
+            await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        else:
+            await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
+        return
+    
+    events = result.get("events", [])
+    
+    # --- Handle match count ---
+    if len(events) == 0:
+        no_match_msg = (
+            f"לא מצאתי אירוע בשם '{hint}' ביומן שלך 🤔\n"
+            f"אפשר לנסות שם אחר או תאריך מדויק יותר?"
+        )
+        firestore_service.save_message(user_id, "assistant", no_match_msg)
+        await message.answer(no_match_msg)
+        return
+    
+    if len(events) > 1:
+        # Multiple matches — ask user to clarify
+        lines = [f"מצאתי כמה אירועים שמתאימים ל'{hint}':\n"]
+        for i, ev in enumerate(events[:5], 1):
+            summary = ev.get("summary", "ללא שם")
+            time_str = _format_event_time(ev)
+            lines.append(f"{i}️⃣ {summary} - {time_str}")
+        lines.append("\nאיזה מהם למחוק?")
+        multi_msg = "\n".join(lines)
+        firestore_service.save_message(user_id, "assistant", multi_msg)
+        await message.answer(multi_msg)
+        return
+    
+    # --- Exactly 1 match: ask for confirmation (Phase 1) ---
+    target_event = events[0]
+    event_id = target_event.get("id")
+    summary = target_event.get("summary", "ללא שם")
+    time_str = _format_event_time(target_event)
+    location = target_event.get("location", "")
+    attendees = target_event.get("attendees", [])
+    
+    # Build confirmation message
+    confirm_lines = [
+        "🗑️ מצאתי את האירוע הזה:\n",
+        f"📌 *{summary}*",
+        f"⏰ {time_str}",
+    ]
+    if location:
+        confirm_lines.append(f"📍 {location}")
+    if attendees:
+        att_names = ", ".join(a.get("displayName", a.get("email", "")) for a in attendees[:5])
+        confirm_lines.append(f"👥 {att_names}")
+    confirm_lines.append("")
+    confirm_lines.append("⚠️ *בטוח שאתה רוצה למחוק את האירוע הזה?*")
+    confirm_lines.append("(כתוב *כן* למחיקה או *לא* לביטול)")
+    
+    confirm_msg = "\n".join(confirm_lines)
+    
+    # Save event data to FSM for Phase 2
+    await state.update_data(
+        delete_event_id=event_id,
+        delete_event_summary=summary,
+        delete_event_time=time_str
+    )
+    await state.set_state(DeleteFlowStates.WAITING_FOR_DELETE_CONFIRM)
+    
+    firestore_service.save_message(user_id, "assistant", confirm_msg)
+    await message.answer(confirm_msg, parse_mode="Markdown")
+
+
+# =============================================================================
+# Delete Confirmation Handler (Phase 2: Execute or Cancel)
+# =============================================================================
+
+# Hebrew confirmation/cancellation keywords
+DELETE_CONFIRM_PHRASES = {"כן", "בטוח", "מחק", "תמחק", "yes", "כן בטוח", "מחק את זה", "כן תמחק"}
+DELETE_CANCEL_PHRASES = {"לא", "ביטול", "תעזוב", "עזוב", "no", "cancel", "אל תמחק", "בטל","לא משנה"}
+
+
+@router.message(DeleteFlowStates.WAITING_FOR_DELETE_CONFIRM)
+async def handle_delete_confirmation(
+    message: Message,
+    state: FSMContext,
+    user: Optional[UserData]
+) -> None:
+    """
+    Handle user's Yes/No response to delete confirmation.
+    Phase 2 of the 2-step deletion FSM.
+    """
+    user_id = message.from_user.id
+    text = message.text.strip().lower() if message.text else ""
+    
+    # Save user message to history
+    firestore_service.save_message(user_id, "user", message.text or "")
+    
+    data = await state.get_data()
+    event_id = data.get("delete_event_id")
+    event_summary = data.get("delete_event_summary", "האירוע")
+    event_time = data.get("delete_event_time", "")
+    
+    if not event_id:
+        await state.clear()
+        await message.answer("🤔 משהו השתבש. נסה שוב.")
+        return
+    
+    # --- User CANCELS ---
+    if text in DELETE_CANCEL_PHRASES:
+        await state.clear()
+        cancel_msg = f"👍 ביטלתי! האירוע *'{event_summary}'* נשמר ביומן שלך. בטוח שלך!"
+        firestore_service.save_message(user_id, "assistant", cancel_msg)
+        await message.answer(cancel_msg, parse_mode="Markdown")
+        return
+    
+    # --- User CONFIRMS ---
+    if text in DELETE_CONFIRM_PHRASES:
+        # Get tokens
+        tokens = get_user_tokens(user) if user else None
+        if not tokens:
+            await state.clear()
+            await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+            return
+        
+        # Execute deletion
+        logger.info(f"[Delete] Confirmed! Deleting event {event_id}")
+        try:
+            delete_result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: calendar_service.delete_event(
+                        tokens, event_id=event_id, user_id=str(user_id)
+                    )
+                ), timeout=10
+            )
+        except asyncio.TimeoutError:
+            await state.clear()
+            await message.answer("⏳ Google Calendar לא הגיב בזמן. נסה שוב.")
+            return
+        except Exception as e:
+            logger.error(f"[Delete] API error: {e}")
+            await state.clear()
+            await message.answer("❌ שגיאה במחיקת האירוע. נסה שוב.")
+            return
+        
+        await state.clear()
+        
+        if delete_result.get("status") == "success":
+            success_msg = (
+                f"✅ האירוע *'{event_summary}'* נמחק מהיומן.\n"
+                f"אם מחקת בטעות, תמיד אפשר ליצור אותו מחדש 📅"
+            )
+            firestore_service.save_message(user_id, "assistant", success_msg)
+            await message.answer(success_msg, parse_mode="Markdown")
+        elif delete_result.get("type") == ERROR_AUTH_REQUIRED:
+            await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        else:
+            await message.answer("❌ שגיאה במחיקת האירוע. נסה שוב.")
+        return
+    
+    # --- Unrecognized input ---
+    unclear_msg = "לא הבנתי 🤔 כתוב *כן* כדי למחוק או *לא* כדי לבטל."
+    firestore_service.save_message(user_id, "assistant", unclear_msg)
+    await message.answer(unclear_msg, parse_mode="Markdown")

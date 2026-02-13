@@ -19,7 +19,7 @@ from services.openai_service import openai_service
 from prompts.base import SYSTEM_PROMPT as BASE_SYSTEM_PROMPT
 from prompts.router import ROUTER_SYSTEM_PROMPT, INTENT_FUNCTION_SCHEMA
 from utils.performance import measure_time
-
+from prompts.skills.chat import CHAT_PROMPT
 
 class LLMService:
     """
@@ -82,19 +82,15 @@ class LLMService:
         )
         
         # Combine: Personality + Router Logic
-        # Extract color map safely (assuming user_data is available in this function's scope)
-        # If user_data isn't passed directly, use user.calendar_config.get("color_map", {}) depending on your user model
-        color_map = {}
-        if hasattr(user, "get"): # Dict access
-            color_map = user.get("calendar_config", {}).get("color_map", {})
-        elif hasattr(user, "calendar_config"): # Object access
-            color_map = user.calendar_config.get("color_map", {})
-            
+        # Extract color map from user_preferences (already passed by caller)
+        color_map = user_preferences.get("color_map", {}) if user_preferences else {}
         colors_str = json.dumps(color_map, ensure_ascii=False) if color_map else "{}"
 
-        # Combine: Personality + Router Logic + Current Colors
-        system_prompt = f"{base_prompt}\n\n---\n\n{router_prompt}\n\n### CURRENT USER COLORS ###\n{colors_str}"
-        
+        # Inject agent name into the chat prompt safely
+        chat_prompt_ready = CHAT_PROMPT.replace("{agent_name}", agent_name)
+
+        # Combine: Personality + Router Logic + Chat Rules + Current Colors
+        system_prompt = f"{base_prompt}\n\n---\n\n{router_prompt}\n\n---\n\n{chat_prompt_ready}\n\n### CURRENT USER COLORS ###\n{colors_str}"
         # Build messages with history
         messages = []
         if history:

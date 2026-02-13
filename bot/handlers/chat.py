@@ -6,8 +6,9 @@ Uses LLM intent classification for intelligent routing.
 Supports intents:
 - create_event: Calendar events
 - get_events: Query calendar / check schedule
+- update_event: Modify/reschedule existing events
+- delete_event: Cancel/remove events (with confirmation)
 - set_reminder: Quick pings/reminders
-- reschedule_event: Move/postpone events
 - edit_preferences: Settings changes
 - chat: General conversation
 """
@@ -29,7 +30,7 @@ from services.openai_service import openai_service
 from services.llm_service import llm_service
 from services.firestore_service import firestore_service
 from bot.utils import get_random_thinking_phrase, get_formatted_current_time
-from bot.handlers.events import process_create_event
+from bot.handlers.events import process_create_event, process_update_event, process_delete_event
 from services.calendar_service import calendar_service
 from utils.performance import measure_time
 
@@ -424,21 +425,13 @@ async def process_user_intent(
         await message.answer(reminder_response, parse_mode="Markdown")
         logger.info(f"✅ [Telegram] Response sent!")
     
-    elif intent == "reschedule_event":
-        logger.info(f"[Routing] -> reschedule_event")
-        original_hint = payload.get("original_event_hint", "האירוע")
-        
-        reschedule_response = (
-            f"🔄 *הזזת אירוע*\n\n"
-            f"אני מבין שאתה רוצה להזיז את *{original_hint}*.\n\n"
-            f"_(פיצ'ר העדכון בפיתוח - בינתיים אפשר למחוק וליצור מחדש)_"
-        )
-        logger.info(f"[Firestore] Saving assistant response")
-        firestore_service.save_message(user_id, "assistant", reschedule_response)
-        
-        logger.info(f"📤 [Telegram] Sending response...")
-        await message.answer(reschedule_response, parse_mode="Markdown")
-        logger.info(f"✅ [Telegram] Response sent!")
+    elif intent == "update_event":
+        logger.info(f"[Routing] -> update_event")
+        await process_update_event(message, user, state, payload, response_text)
+    
+    elif intent == "delete_event":
+        logger.info(f"[Routing] -> delete_event")
+        await process_delete_event(message, user, state, payload, response_text)
     
     elif intent == "edit_preferences":
         logger.info(f"[Routing] -> edit_preferences")

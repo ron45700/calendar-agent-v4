@@ -114,6 +114,9 @@ A name in the event title is NOT automatically an attendee.
 - Possessive: "השיעור של מיכל"
 - Subject-of: "פגישה על הפרויקט של דני"
 
+### TRANSCRIPTION AUTO-CORRECT (CRITICAL) ###
+The user's input is often transcribed from Voice-to-Text and may contain phonetic spelling mistakes in Hebrew (e.g., writing "הוגה" instead of "עוגה", mixing א/ע, ט/ת, ח/כ, etc.). 
+Before extracting data into the JSON payload (especially for `summary`, `description`, `location`, or `new_summary`), you MUST evaluate the context and automatically correct any spelling or grammatical errors. Ensure the final text in the JSON is perfectly written in proper Hebrew.
 ---
 
 ## COLOR HIERARCHY (Strict Order)

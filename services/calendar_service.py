@@ -251,15 +251,9 @@ class CalendarService:
             if event_data.get("location"):
                 event_body["location"] = event_data["location"]
             
-            # Color ID
-            if color_id:
-                event_body["colorId"] = str(color_id)
-            elif event_data.get("category"):
-                # Map category to color
-                category = event_data["category"]
-                event_body["colorId"] = str(CATEGORY_COLOR_MAP.get(category, DEFAULT_COLOR_ID))
-            else:
-                event_body["colorId"] = str(DEFAULT_COLOR_ID)
+            # Color ID — resolved upstream by events.py handler
+            # Only apply default if no color_id was provided at all
+            event_body["colorId"] = str(color_id) if color_id else str(DEFAULT_COLOR_ID)
             
             # Attendees
             if event_data.get("resolved_attendees"):
