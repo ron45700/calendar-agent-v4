@@ -271,6 +271,19 @@ class CalendarService:
                 ]
             }
             
+            # Recurrence (RRULE)
+            recurrence_freq = event_data.get("recurrence_freq")
+            if recurrence_freq:
+                rrule = self._build_rrule(
+                    freq=recurrence_freq,
+                    interval=event_data.get("recurrence_interval", 1),
+                    end_date=event_data.get("recurrence_end_date"),
+                    start_time=event_data.get("start_time")
+                )
+                if rrule:
+                    event_body["recurrence"] = [f"RRULE:{rrule}"]
+                    print(f"[Calendar] Added recurrence: {rrule}")
+            
             print(f"[Calendar] Creating event: {event_body.get('summary')}")
             
             # Insert event
@@ -340,6 +353,69 @@ class CalendarService:
             print(f"[Calendar] Error formatting datetime {dt_string}: {e}")
             # Fallback
             return {"dateTime": dt_string, "timeZone": "Asia/Jerusalem"}
+    
+    def _build_rrule(
+        self,
+        freq: str,
+        interval: int = 1,
+        end_date: Optional[str] = None,
+        start_time: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Build RFC 5545 RRULE string for recurring events.
+        
+        Args:
+            freq: Frequency (DAILY, WEEKLY, MONTHLY, YEARLY)
+            interval: Recurrence interval (default: 1)
+            end_date: ISO 8601 end date (YYYY-MM-DD) or None for no end
+            start_time: ISO 8601 start time (for BYDAY calculation in WEEKLY)
+            
+        Returns:
+            RRULE string or None if invalid
+        """
+        if freq not in ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]:
+            print(f"[Calendar] Invalid recurrence frequency: {freq}")
+            return None
+        
+        rrule_parts = [f"FREQ={freq}"]
+        
+        # Add interval if > 1
+        if interval > 1:
+            rrule_parts.append(f"INTERVAL={interval}")
+        
+        # For WEEKLY events, add BYDAY based on start_time
+        if freq == "WEEKLY" and start_time:
+            try:
+                dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                # RFC 5545 day abbreviations: MO, TU, WE, TH, FR, SA, SU
+                day_map = {
+                    0: "MO",  # Monday
+                    1: "TU",  # Tuesday
+                    2: "WE",  # Wednesday
+                    3: "TH",  # Thursday
+                    4: "FR",  # Friday
+                    5: "SA",  # Saturday
+                    6: "SU"   # Sunday
+                }
+                day_abbr = day_map.get(dt.weekday())
+                if day_abbr:
+                    rrule_parts.append(f"BYDAY={day_abbr}")
+            except Exception as e:
+                print(f"[Calendar] Error parsing start_time for BYDAY: {e}")
+        
+        # Add end condition
+        if end_date:
+            try:
+                # Parse end_date (YYYY-MM-DD) and format as YYYYMMDD
+                end_dt = datetime.fromisoformat(end_date)
+                rrule_parts.append(f"UNTIL={end_dt.strftime('%Y%m%d')}")
+            except Exception as e:
+                print(f"[Calendar] Error formatting end_date: {e}")
+        # If no end_date, recurrence continues indefinitely (no UNTIL clause)
+        
+        rrule = ";".join(rrule_parts)
+        print(f"[Calendar] Built RRULE: {rrule}")
+        return rrule
     
     def get_upcoming_events(
         self,

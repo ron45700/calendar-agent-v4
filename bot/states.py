@@ -78,3 +78,40 @@ class DeleteFlowStates(StatesGroup):
     """
     # User must confirm or cancel the pending deletion
     WAITING_FOR_DELETE_CONFIRM = State()
+
+
+class RecurrenceFlowStates(StatesGroup):
+    """
+    States for the recurring event end-condition flow.
+    When user requests a recurring event without an end date,
+    the bot asks "until when?" and waits for the answer.
+    """
+    WAITING_FOR_END_CONDITION = State()
+
+
+class AdminTestStates(StatesGroup):
+    """
+    States for Admin Test Suite.
+    Fully isolated from regular user flows.
+    Requires password-protected entry.
+    """
+    # Main menu - user selects test
+    MAIN_MENU = State()
+    
+    # Test 1: CRUD Obstacle Course
+    CRUD_CREATE = State()
+    CRUD_READ = State()
+    CRUD_UPDATE = State()
+    CRUD_DELETE = State()
+    
+    # Test 2: Onboarding Simulation
+    ONBOARDING_SIM = State()
+    
+    # Test 3: Voice Loop
+    VOICE_LOOP = State()
+    
+    # Test 4: Search Loop
+    SEARCH_LOOP = State()
+    
+    # Test 5: Dry-Run Event
+    DRY_RUN_EVENT = State()

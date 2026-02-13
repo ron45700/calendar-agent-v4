@@ -32,6 +32,40 @@ Classify the user's intent and extract relevant structured data.
 **When:** User wants to schedule something in the calendar.
 **Keywords:** "תקבע", "קבע לי", "פגישה", "אירוע", "שיעור", "אימון"
 
+#### RECURRING EVENT DETECTION
+Set recurrence fields when user mentions repetition:
+- **Daily:** "כל יום", "יומי", "מדי יום", "daily", "every day"
+- **Weekly:** "כל שבוע", "שבועי", "מדי שבוע", "weekly", "every week"
+- **Monthly:** "כל חודש", "חודשי", "מדי חודש", "monthly", "every month"
+- **Yearly:** "כל שנה", "שנתי", "מדי שנה", "yearly", "every year"
+- **Specific days:** "כל יום שני", "כל יום ראשון", "every Monday", "every Tuesday"
+
+**Recurrence interval:**
+- Extract number from phrases like "כל 2 שבועות" → interval=2, freq=WEEKLY
+- Default interval is 1 if not specified
+
+**End date:**
+- Extract if user says "עד", "עד ה-", "until", "until [date]"
+- If no end date provided, leave `recurrence_end_date` empty (bot will ask "until when?")
+
+#### ALL-DAY & MULTI-DAY EVENT DETECTION
+Set `is_all_day: true` in the payload when ANY of the following apply:
+- **No specific hour/time** is mentioned ("יום הולדת ביום שישי", "חופשה מרביעי עד שבת")
+- **All-day keywords:** "חופשה", "יום הולדת", "החג", "בחירות", "יום חופש", "vacation", "birthday"
+- **Dates without hours:** "מ-15 לחודש עד ה-18", "מיום שלישי עד יום שישי"
+- **User explicitly says** "כל היום", "יום שלם", "בלי שעות", "all day"
+- **Duration in days:** "ממחר למשך 3 ימים", "ל-4 ימים"
+- **Full date range:** "מיום ראשון עד יום רביעי", "מ-20/02 עד 25/02"
+
+**All-day time formatting rules:**
+- Use DATE-ONLY format for `start_time` and `end_time` (YYYY-MM-DD, no T or timezone)
+- For **single-day** events: `end_time` = start + 1 day (Google Calendar uses exclusive end)
+  Example: Birthday on Feb 20 → start="2026-02-20", end="2026-02-21"
+- For **multi-day** events: `end_time` = last day + 1 day
+  Example: Vacation Wed-Sat (Feb 18-21) → start="2026-02-18", end="2026-02-22"
+- For **duration in days**: Calculate from start + N days
+  Example: "ממחר למשך 3 ימים" → start=tomorrow, end=tomorrow+3 days
+
 ### 2. `set_reminder` - Reminder (In Development)
 **When:** User wants a simple reminder, not a calendar event.
 **Keywords:** "תזכיר לי", "אל תתן לי לשכוח", "remind me"
@@ -77,7 +111,12 @@ Classify the user's intent and extract relevant structured data.
   - `original_event_hint` (REQUIRED): Search keyword to locate the event
   - `time_hint`: Time range hint to narrow the search (e.g. "מחר", "ביום שלישי")
 
-### 8. `chat` - General Conversation
+### 8. `admin_test` - Admin Test Suite Entry
+**When:** User requests admin test suite access (requires password).
+**Keywords:** "admin_test", "טסט אדמין"
+**Note:** This intent is handled before LLM classification in chat.py for efficiency.
+
+### 9. `chat` - General Conversation
 **When:** Questions, greetings, or out-of-scope requests.
 **Keywords:** "מה אתה יודע", "מה שלומך", "תודה", requests unrelated to calendar
 
@@ -142,6 +181,9 @@ Before extracting data into the JSON payload (especially for `summary`, `descrip
     "category": "work|meeting|personal|sport|study|health|family|fun|other",
     "location": "Location",
     "is_all_day": false,
+    "recurrence_freq": "DAILY|WEEKLY|MONTHLY|YEARLY",
+    "recurrence_interval": 1,
+    "recurrence_end_date": "YYYY-MM-DD",
     "original_intent": "set_reminder",  // Only if converted
     
     // For edit_preferences:
@@ -236,6 +278,21 @@ Before extracting data into the JSON payload (especially for `summary`, `descrip
 {{"intent": "create_event", "response_text": "בוצע! 💚 פרויקט נקבע למחר ב-14:00 בירוק.", "payload": {{"summary": "פרויקט", "start_time": "2026-02-13T14:00:00+02:00", "end_time": "2026-02-13T15:00:00+02:00", "category": "work", "color_name": "basil", "color_name_hebrew": "ירוק"}}}}
 ```
 
+**User:** "חופשה באילת מרביעי עד שבת"
+```json
+{{"intent": "create_event", "response_text": "איזה כיף! 🏖️ חופשה באילת נרשמה מרביעי עד שבת!", "payload": {{"summary": "חופשה באילת", "start_time": "2026-02-18", "end_time": "2026-02-22", "is_all_day": true, "category": "personal"}}}}
+```
+
+**User:** "יום הולדת של נועם ביום שישי"
+```json
+{{"intent": "create_event", "response_text": "מזל טוב! 🎂 יום הולדת של נועם נרשם ליום שישי!", "payload": {{"summary": "יום הולדת של נועם", "start_time": "2026-02-20", "end_time": "2026-02-21", "is_all_day": true, "category": "personal"}}}}
+```
+
+**User:** "אני במילואים ממחר למשך 3 ימים"
+```json
+{{"intent": "create_event", "response_text": "נרשם! 🛩️ מילואים נרשמו ל-3 ימים ממחר.", "payload": {{"summary": "מילואים", "start_time": "2026-02-14", "end_time": "2026-02-17", "is_all_day": true, "category": "personal"}}}}
+```
+
 **User:** "תזיז את הפגישה עם דני ליום ראשון ב-16:00"
 ```json
 {{"intent": "update_event", "response_text": "מחפש את הפגישה עם דני... 🔍", "payload": {{"original_event_hint": "פגישה עם דני", "new_start_time": "2026-02-15T16:00:00+02:00", "new_end_time": "2026-02-15T17:00:00+02:00"}}}}
@@ -266,6 +323,21 @@ Before extracting data into the JSON payload (especially for `summary`, `descrip
 {{"intent": "delete_event", "response_text": "מחפש את האימון... 🔍", "payload": {{"original_event_hint": "אימון", "time_hint": "tomorrow"}}}}
 ```
 
+**User:** "תקבע לי אימון כל יום שני ב-18:00"
+```json
+{{"intent": "create_event", "response_text": "קבעתי אימון חוזר כל יום שני ב-18:00! 💪", "payload": {{"summary": "אימון", "start_time": "2026-02-16T18:00:00+02:00", "end_time": "2026-02-16T19:00:00+02:00", "category": "sport", "recurrence_freq": "WEEKLY", "recurrence_interval": 1}}}}
+```
+
+**User:** "פגישה שבועית עם הצוות כל יום ראשון ב-10:00 עד סוף מרץ"
+```json
+{{"intent": "create_event", "response_text": "קבעתי פגישה שבועית חוזרת כל יום ראשון ב-10:00 עד סוף מרץ! 📅", "payload": {{"summary": "פגישה עם הצוות", "start_time": "2026-02-15T10:00:00+02:00", "end_time": "2026-02-15T11:00:00+02:00", "category": "meeting", "recurrence_freq": "WEEKLY", "recurrence_interval": 1, "recurrence_end_date": "2026-03-31"}}}}
+```
+
+**User:** "שיעור יוגה כל יום ב-7 בבוקר"
+```json
+{{"intent": "create_event", "response_text": "קבעתי שיעור יוגה חוזר כל יום ב-07:00! 🧘", "payload": {{"summary": "שיעור יוגה", "start_time": "2026-02-14T07:00:00+02:00", "end_time": "2026-02-14T08:00:00+02:00", "category": "sport", "recurrence_freq": "DAILY", "recurrence_interval": 1}}}}
+```
+
 ---
 
 Remember: Always return valid JSON. If unsure, use intent `chat`.
@@ -284,7 +356,7 @@ INTENT_FUNCTION_SCHEMA = {
         "properties": {
             "intent": {
                 "type": "string",
-                "enum": ["create_event", "set_reminder", "daily_check_setup", "edit_preferences", "get_events", "update_event", "delete_event", "chat"],
+                "enum": ["create_event", "set_reminder", "daily_check_setup", "edit_preferences", "get_events", "update_event", "delete_event", "admin_test", "chat"],
                 "description": "The classified intent of the user's message"
             },
             "response_text": {
@@ -321,6 +393,21 @@ INTENT_FUNCTION_SCHEMA = {
                     "location": {"type": "string", "description": "Event location"},
                     "description": {"type": "string", "description": "Event description"},
                     "is_all_day": {"type": "boolean", "description": "All-day event flag"},
+                    
+                    # Recurrence fields (RFC 5545 RRULE)
+                    "recurrence_freq": {
+                        "type": "string",
+                        "enum": ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"],
+                        "description": "Recurrence frequency. Extract from phrases like 'כל יום', 'כל שבוע', 'כל חודש', 'כל שנה'"
+                    },
+                    "recurrence_interval": {
+                        "type": "integer",
+                        "description": "Recurrence interval (e.g., 2 for 'every 2 weeks'). Default: 1"
+                    },
+                    "recurrence_end_date": {
+                        "type": "string",
+                        "description": "ISO 8601 date when recurrence ends (YYYY-MM-DD). Leave empty if user didn't specify end date."
+                    },
                     
                     # Safety net field
                     "original_intent": {

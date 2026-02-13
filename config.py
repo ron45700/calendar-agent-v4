@@ -66,6 +66,12 @@ DEFAULT_COLOR_MAP = {
     "health": "6",     # Tangerine
 }
 
+# =============================================================================
+# Admin Test Suite Configuration
+# =============================================================================
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "cks")  # Default: "cks" or "bol"
+ADMIN_TEST_ENABLED = os.getenv("ADMIN_TEST_ENABLED", "true").lower() == "true"
+
 
 # =============================================================================
 # Credential Loading Helper

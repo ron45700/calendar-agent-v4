@@ -33,6 +33,8 @@ from bot.utils import get_random_thinking_phrase, get_formatted_current_time
 from bot.handlers.events import process_create_event, process_update_event, process_delete_event
 from services.calendar_service import calendar_service
 from utils.performance import measure_time
+from config import ADMIN_PASSWORD, ADMIN_TEST_ENABLED
+from bot.states import AdminTestStates
 
 
 # =============================================================================
@@ -248,6 +250,48 @@ async def handle_text_message(message: Message, user: Optional[UserData], state:
     
     # Check for welcome back
     await check_and_send_welcome_back(message, user, user_id)
+    
+    # Check for admin test entry (BEFORE LLM call to save API costs)
+    if ADMIN_TEST_ENABLED:
+        text_lower = text.lower().strip()
+        # Check for admin_test keyword
+        if "admin_test" in text_lower or "טסט אדמין" in text_lower:
+            # Extract password (everything after the keyword)
+            parts = text_lower.split()
+            password_index = -1
+            for i, part in enumerate(parts):
+                if "admin_test" in part or "טסט" in part:
+                    password_index = i + 1
+                    break
+            
+            if password_index < len(parts):
+                provided_password = parts[password_index]
+            else:
+                provided_password = ""
+            
+            # Case-insensitive password check
+            if provided_password.lower() in [ADMIN_PASSWORD.lower(), "cks", "bol"]:
+                # Valid password - enter admin test suite
+                await state.set_state(AdminTestStates.MAIN_MENU)
+                menu_msg = (
+                    "🧪 *Admin Test Suite*\n\n"
+                    "בחר בדיקה:\n"
+                    "1️⃣ CRUD Obstacle Course\n"
+                    "2️⃣ Onboarding Simulation\n"
+                    "3️⃣ Voice Loop\n"
+                    "4️⃣ Search Loop\n"
+                    "5️⃣ Dry-Run Event\n\n"
+                    "לצאת: כתוב *צא* או *exit*"
+                )
+                firestore_service.save_message(user_id, "assistant", menu_msg)
+                await message.answer(menu_msg, parse_mode="Markdown")
+                logger.info(f"[AdminTest] User {user_id} entered admin test suite")
+                return
+            else:
+                # Invalid password
+                await message.answer("❌ סיסמה שגויה.")
+                logger.warning(f"[AdminTest] User {user_id} attempted admin test with wrong password")
+                return
     
     # Save to history
     logger.info(f"[Firestore] Saving user message to history")

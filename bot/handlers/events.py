@@ -5,7 +5,7 @@ Handles calendar event creation from parsed intent payloads.
 
 import re
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
@@ -18,7 +18,7 @@ from services.calendar_service import (
     CALENDAR_COLORS, COLOR_ID_EMOJI, DEFAULT_EVENT_EMOJI
 )
 from services.firestore_service import firestore_service
-from bot.states import EventFlowStates, DeleteFlowStates
+from bot.states import EventFlowStates, DeleteFlowStates, RecurrenceFlowStates
 from bot.utils import get_formatted_current_time
 from config import WEBAPP_URL
 
@@ -179,7 +179,41 @@ async def process_create_event(
             await message.answer(ask_email_msg, parse_mode="Markdown")
             return
     
-    # All contacts resolved - create event
+    # Check for recurring event without end date
+    recurrence_freq = payload.get("recurrence_freq")
+    recurrence_end_date = payload.get("recurrence_end_date")
+    
+    if recurrence_freq and not recurrence_end_date:
+        # Recurring event without end date - ask "until when?"
+        await state.update_data(
+            pending_event=payload,
+            original_response=response_text
+        )
+        await state.set_state(RecurrenceFlowStates.WAITING_FOR_END_CONDITION)
+        
+        # Build frequency description in Hebrew
+        freq_map = {
+            "DAILY": "יומי",
+            "WEEKLY": "שבועי",
+            "MONTHLY": "חודשי",
+            "YEARLY": "שנתי"
+        }
+        freq_desc = freq_map.get(recurrence_freq, "חוזר")
+        interval = payload.get("recurrence_interval", 1)
+        if interval > 1:
+            freq_desc = f"כל {interval} {freq_desc.lower()}"
+        
+        ask_end_msg = (
+            f"📅 שמתי לב שזה אירוע {freq_desc}.\n\n"
+            f"עד מתי האירוע צריך לחזור?\n"
+            f"(תן לי תאריך, למשל: 'עד סוף מרץ', 'עד ה-15/03', 'עד 31 במרץ')"
+        )
+        
+        firestore_service.save_message(user_id, "assistant", ask_end_msg)
+        await message.answer(ask_end_msg)
+        return
+    
+    # All contacts resolved and recurrence handled - create event
     await create_event_from_payload(message, user, payload, response_text)
 
 
@@ -245,6 +279,15 @@ async def create_event_from_payload(
         color_source = f"default Tangerine ({DEFAULT_COLOR_ID})"
     
     logger.info(f"[Color] Resolved: {color_source}")
+    
+    # All-day event guard: ensure end_time is set (Google API requires it)
+    if payload.get("is_all_day") and not payload.get("end_time"):
+        try:
+            start_date = datetime.fromisoformat(payload["start_time"])
+            payload["end_time"] = (start_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info(f"[AllDay] Auto-set end_time to {payload['end_time']}")
+        except Exception as e:
+            logger.warning(f"[AllDay] Failed to auto-set end_time: {e}")
     
     # Create event - pass user_id for auth cleanup on failure
     result = calendar_service.add_event(
@@ -811,6 +854,146 @@ async def process_delete_event(
 # Hebrew confirmation/cancellation keywords
 DELETE_CONFIRM_PHRASES = {"כן", "בטוח", "מחק", "תמחק", "yes", "כן בטוח", "מחק את זה", "כן תמחק"}
 DELETE_CANCEL_PHRASES = {"לא", "ביטול", "תעזוב", "עזוב", "no", "cancel", "אל תמחק", "בטל","לא משנה"}
+
+
+# =============================================================================
+# Recurrence End Date Handler
+# =============================================================================
+
+@router.message(RecurrenceFlowStates.WAITING_FOR_END_CONDITION)
+async def handle_recurrence_end_date(
+    message: Message,
+    state: FSMContext,
+    user: Optional[UserData]
+) -> None:
+    """
+    Handle user providing end date for recurring event.
+    Uses LLM to parse the date from natural language.
+    """
+    user_id = message.from_user.id
+    user_text = message.text.strip() if message.text else ""
+    
+    # Save user message to history
+    firestore_service.save_message(user_id, "user", user_text)
+    
+    # Cancel detection
+    CANCEL_PHRASES = {"בטל", "עזוב", "לא משנה", "תעצור", "cancel", "stop", "abort"}
+    if user_text.lower() in CANCEL_PHRASES:
+        await state.clear()
+        cancel_msg = "❌ האירוע בוטל."
+        firestore_service.save_message(user_id, "assistant", cancel_msg)
+        await message.answer(cancel_msg)
+        return
+    
+    # Get pending event data
+    data = await state.get_data()
+    pending_event = data.get("pending_event")
+    original_response = data.get("original_response", "")
+    
+    if not pending_event:
+        await state.clear()
+        await message.answer("🤔 משהו השתבש. נסה שוב.")
+        return
+    
+    # Use router's LLM to parse end date from user's natural language
+    try:
+        from services.llm_service import llm_service
+        from bot.utils import get_formatted_current_time
+        
+        current_time = get_formatted_current_time()
+        
+        # Create a focused prompt for date extraction by reusing router
+        # We'll create a temporary create_event payload to leverage the router's date parsing
+        temp_payload = {
+            "summary": pending_event.get("summary", "אירוע"),
+            "start_time": pending_event.get("start_time", ""),
+            "recurrence_freq": pending_event.get("recurrence_freq"),
+            "recurrence_interval": pending_event.get("recurrence_interval", 1)
+        }
+        
+        # Use router to parse the end date from user's text
+        # We'll ask it to extract recurrence_end_date from the user's response
+        parse_query = f"עד מתי האירוע צריך לחזור? {user_text}"
+        
+        # Reuse router's intent classification but focus on extracting end date
+        result = await llm_service.parse_user_intent(
+            text=parse_query,
+            current_time=current_time,
+            user_preferences={},
+            contacts={},
+            history=None,
+            agent_name="הבוט",
+            user_nickname="חבר"
+        )
+        
+        parsed_end_date = result.get("payload", {}).get("recurrence_end_date")
+        
+        if parsed_end_date:
+            # Validate date format
+            try:
+                datetime.fromisoformat(parsed_end_date)
+                pending_event["recurrence_end_date"] = parsed_end_date
+                logger.info(f"[Recurrence] Parsed end date: {parsed_end_date}")
+            except ValueError:
+                logger.warning(f"[Recurrence] Invalid date format: {parsed_end_date}")
+                error_msg = (
+                    "❌ לא הצלחתי להבין את התאריך.\n"
+                    "נסה שוב בפורמט ברור יותר, למשל: 'עד סוף מרץ' או 'עד ה-15/03'"
+                )
+                firestore_service.save_message(user_id, "assistant", error_msg)
+                await message.answer(error_msg)
+                return
+        else:
+            error_msg = (
+                "❌ לא הצלחתי להבין את התאריך.\n"
+                "נסה שוב בפורמט ברור יותר, למשל: 'עד סוף מרץ' או 'עד ה-15/03'"
+            )
+            firestore_service.save_message(user_id, "assistant", error_msg)
+            await message.answer(error_msg)
+            return
+    
+    except Exception as e:
+        logger.error(f"[Recurrence] Error parsing end date: {e}")
+        error_msg = (
+            "❌ שגיאה בעיבוד התאריך.\n"
+            "נסה שוב בפורמט ברור יותר, למשל: 'עד סוף מרץ' או 'עד ה-15/03'"
+        )
+        firestore_service.save_message(user_id, "assistant", error_msg)
+        await message.answer(error_msg)
+        return
+    
+    # Clear state and create event with end date
+    await state.clear()
+    
+    # Check for missing contacts before creating
+    attendee_names = pending_event.get("attendees", [])
+    user_contacts = user.get("contacts", {}) if user else {}
+    
+    if attendee_names:
+        missing_contacts = find_missing_contacts(attendee_names, user_contacts)
+        if missing_contacts:
+            # Re-enter missing contact flow
+            missing_name = missing_contacts[0]
+            await state.update_data(
+                pending_event=pending_event,
+                missing_contact_name=missing_name,
+                remaining_missing=missing_contacts[1:] if len(missing_contacts) > 1 else [],
+                original_response=original_response
+            )
+            await state.set_state(EventFlowStates.WAITING_FOR_MISSING_CONTACT_EMAIL)
+            
+            ask_email_msg = (
+                f"👤 שמתי לב שביקשת להזמין את *{missing_name}*,\n"
+                f"אבל אין לי את המייל שלו.\n\n"
+                f"מה המייל של {missing_name}?"
+            )
+            firestore_service.save_message(user_id, "assistant", ask_email_msg)
+            await message.answer(ask_email_msg, parse_mode="Markdown")
+            return
+    
+    # All good - create event
+    fresh_user = firestore_service.get_user(user_id) or user
+    await create_event_from_payload(message, fresh_user, pending_event, original_response)
 
 
 @router.message(DeleteFlowStates.WAITING_FOR_DELETE_CONFIRM)
