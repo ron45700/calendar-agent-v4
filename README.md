@@ -157,17 +157,11 @@ For developers: a password-protected flow to run automated checks.
 
 1. In Telegram, ask the bot to run tests (e.g. "בוא נריץ בדיקות").
 2. Bot replies asking you to prove you’re admin by sending the **secret password**.
-3. Send the password (e.g. value of `ADMIN_PASSWORD`, or `cks` / `bol` if configured).
+3. Send the password (e.g. value of `ADMIN_PASSWORD`).
 4. You get a menu with 5 tests: CRUD obstacle course, onboarding sim, voice loop, search loop, dry-run event.
 5. Type **צא** or **exit** anytime to leave the suite.
 
-Entry can also be done in one message: `admin_test <password>` (e.g. `admin_test cks`).
-
----
-
-## 📜 License
-
-See [LICENSE](LICENSE) in the repository (if present). Otherwise, use and modification are at your discretion.
+Entry can also be done in one message: `admin_test <password>`.
 
 ---
 
