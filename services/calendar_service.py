@@ -39,19 +39,19 @@ CALENDAR_COLORS = {
 
 # Category to color mapping
 CATEGORY_COLOR_MAP = {
-    "work": 9,          # Blueberry
-    "meeting": 7,       # Peacock (Cyan)
-    "personal": 5,      # Banana
-    "family": 4,        # Flamingo
-    "health": 10,       # Basil
+    "work": 6,          # Tangerine (Orange)
+    "meeting": 6,       # Tangerine
+    "personal": 6,      # Tangerine
+    "family": 6,        # Tangerine
+    "health": 6,        # Tangerine
     "sport": 6,         # Tangerine
-    "study": 3,         # Grape
-    "fun": 11,          # Tomato
-    "general": 7,       # Peacock (Cyan) - default fallback
-    "other": 8          # Graphite
+    "study": 6,         # Tangerine
+    "fun": 6,           # Tangerine
+    "general": 6,       # Tangerine - default fallback
+    "other": 6          # Tangerine
 }
 
-DEFAULT_COLOR_ID = 7  # Peacock (Cyan)
+DEFAULT_COLOR_ID = 6  # Tangerine (Orange)
 
 # Color ID to Emoji mapping for briefing display
 COLOR_ID_EMOJI = {
