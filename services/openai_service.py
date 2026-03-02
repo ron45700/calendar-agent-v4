@@ -3,11 +3,13 @@ OpenAI service for Agentic Calendar 2.0
 Handles Whisper transcription and Chat Completions.
 """
 
+import asyncio
 import os
 import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict
 
+import httpx
 import openai
 from openai import OpenAI, AsyncOpenAI
 
@@ -40,18 +42,40 @@ class OpenAIService:
     @property
     def async_client(self) -> AsyncOpenAI:
         """Lazy initialization of async OpenAI client.
-        
-        Timeout is set on the client itself (SDK best practice) so that
-        openai.APITimeoutError is raised, which participates in the SDK's
-        automatic retry logic (retried twice by default).
+
+        Fix #1 — Force IPv4: Cloud Run has inconsistent IPv6 connectivity.
+        Default httpx resolves IPv6 first, causing 5-20s DNS hangs.
+        local_address="0.0.0.0" forces the transport to bind to an IPv4
+        address, bypassing AAAA lookups entirely.
+
+        Fix #3 — max_retries=0: The SDK's built-in retry multiplies the
+        25s timeout (2 retries = 75s worst-case before user sees error).
+        Our llm_service.py already catches APITimeoutError and returns a
+        friendly message, so SDK-level retries are redundant here.
         """
         if self._async_client is None:
             if not OPENAI_API_KEY:
                 raise ValueError("OPENAI_API_KEY not set in environment variables")
+            # Force IPv4 transport to avoid Cloud Run IPv6 DNS hang
+            transport = httpx.AsyncHTTPTransport(
+                local_address="0.0.0.0",  # Bind to IPv4 interface only
+                retries=0,                # No httpx-level retries (SDK controls retries)
+            )
+            http_client = httpx.AsyncClient(
+                transport=transport,
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                    keepalive_expiry=30,
+                ),
+                # Short connect timeout: fail fast if IPv6 somehow still tries
+                timeout=httpx.Timeout(25.0, connect=5.0),
+            )
             self._async_client = AsyncOpenAI(
                 api_key=OPENAI_API_KEY,
+                http_client=http_client,
                 timeout=25.0,   # SDK-native timeout — raises openai.APITimeoutError
-                max_retries=2,  # default, made explicit for clarity
+                max_retries=0,  # Fix #3: Disable silent SDK retries (75s worst-case → 25s)
             )
         return self._async_client
     
@@ -89,19 +113,26 @@ class OpenAIService:
     
     async def transcribe_audio_async(self, file_path: str, language: str = "he") -> str:
         """
-        Async wrapper for transcribe_audio.
-        Uses sync API internally (OpenAI SDK handles it).
-        
+        True async Whisper transcription.
+
+        Fix #2 — Non-blocking: The sync OpenAI client blocks the thread it runs
+        on. In an asyncio event loop (aiogram on Cloud Run with 1 CPU), calling
+        it directly inside `async def` freezes ALL other requests for the full
+        Whisper round-trip (~1-4s). run_in_executor offloads it to a thread pool
+        worker, keeping the event loop free to handle other messages concurrently.
+
         Args:
             file_path: Path to the audio file
             language: Language code for transcription
-            
+
         Returns:
             Transcribed text
         """
-        # OpenAI Python SDK is sync, but we can still call it in async context
-        # For true async, consider using httpx directly or run_in_executor
-        return self.transcribe_audio(file_path, language)
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,  # Default ThreadPoolExecutor
+            lambda: self.transcribe_audio(file_path, language)
+        )
     
     # =========================================================================
     # Chat Completions

@@ -537,6 +537,44 @@ def _format_event_time(event: Dict[str, Any]) -> str:
     return "לא ידוע"
 
 
+def _format_event_card(event: dict) -> str:
+    """
+    Render a Google Calendar event as a unified visual card.
+
+    Used by both process_update_event (Before-state) and process_delete_event
+    (confirmation display) so the two flows look identical to the user.
+
+    Example output:
+        📌 *פגישה עם רון*
+        ⏰ יום שני 10/03 ב-14:00
+        📍 משרד
+        👥 רון, דני
+    """
+    summary = event.get("summary", "ללא שם")
+    time_str = _format_event_time(event)
+    location = event.get("location", "")
+    attendees = event.get("attendees", [])
+    color_id = str(event.get("colorId", ""))
+
+    lines = [
+        f"📌 *{summary}*",
+        f"⏰ {time_str}",
+    ]
+    if location:
+        lines.append(f"📍 {location}")
+    if attendees:
+        att_names = ", ".join(
+            a.get("displayName", a.get("email", "")) for a in attendees[:5]
+        )
+        lines.append(f"👥 {att_names}")
+    if color_id:
+        color_emoji = COLOR_ID_EMOJI.get(color_id, "")
+        if color_emoji:
+            lines.append(f"🎨 {color_emoji}")
+
+    return "\n".join(lines)
+
+
 async def process_update_event(
     message: Message,
     user: UserData,
@@ -723,12 +761,18 @@ async def process_update_event(
             await message.answer(f"❌ {error_msg}")
         return
     
-    # SUCCESS — build the Before→After diff message
+    # SUCCESS — build the Before→After diff message using the unified card
+    before_card = _format_event_card(target_event)
     diff_display = "\n\n".join(diff_lines)
-    success_msg = f"✅ האירוע עודכן בהצלחה!\n\n{diff_display}\n\nעוד שינוי? 😎"
-    
+    success_msg = (
+        f"✅ *האירוע עודכן בהצלחה!*\n\n"
+        f"⬅️ *לפני:*\n{before_card}\n\n"
+        f"➡️ *השינויים:*\n{diff_display}\n\n"
+        f"עוד שינוי? 😎"
+    )
+
     firestore_service.save_message(user_id, "assistant", success_msg)
-    await message.answer(success_msg)
+    await message.answer(success_msg, parse_mode="Markdown")
 
 
 # =============================================================================
@@ -818,23 +862,15 @@ async def process_delete_event(
     location = target_event.get("location", "")
     attendees = target_event.get("attendees", [])
     
-    # Build confirmation message
-    confirm_lines = [
-        "🗑️ מצאתי את האירוע הזה:\n",
-        f"📌 *{summary}*",
-        f"⏰ {time_str}",
-    ]
-    if location:
-        confirm_lines.append(f"📍 {location}")
-    if attendees:
-        att_names = ", ".join(a.get("displayName", a.get("email", "")) for a in attendees[:5])
-        confirm_lines.append(f"👥 {att_names}")
-    confirm_lines.append("")
-    confirm_lines.append("⚠️ *בטוח שאתה רוצה למחוק את האירוע הזה?*")
-    confirm_lines.append("(כתוב *כן* למחיקה או *לא* לביטול)")
-    
-    confirm_msg = "\n".join(confirm_lines)
-    
+    # Build confirmation message using the unified event card
+    event_card = _format_event_card(target_event)
+    confirm_msg = (
+        f"🗑️ *מצאתי את האירוע הזה:*\n\n"
+        f"{event_card}\n\n"
+        f"⚠️ *בטוח שאתה רוצה למחוק את האירוע הזה?*\n"
+        f"(כתוב *כן* למחיקה או *לא* לביטול)"
+    )
+
     # Save event data to FSM for Phase 2
     await state.update_data(
         delete_event_id=event_id,
@@ -842,7 +878,7 @@ async def process_delete_event(
         delete_event_time=time_str
     )
     await state.set_state(DeleteFlowStates.WAITING_FOR_DELETE_CONFIRM)
-    
+
     firestore_service.save_message(user_id, "assistant", confirm_msg)
     await message.answer(confirm_msg, parse_mode="Markdown")
 

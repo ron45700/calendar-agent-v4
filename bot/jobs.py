@@ -6,6 +6,7 @@ Triggered by Cloud Scheduler via POST /tasks/daily-briefing.
 """
 
 import logging
+import random
 from typing import Optional
 from aiogram import Bot
 
@@ -13,6 +14,18 @@ from services.firestore_service import firestore_service
 from services.calendar_service import calendar_service, ERROR_AUTH_REQUIRED
 
 logger = logging.getLogger(__name__)
+
+
+# Pool of motivational messages for days with no events.
+# Randomly selected so daily users don’t see the same text every morning.
+EMPTY_SCHEDULE_MESSAGES = [
+    "🌟 אין אירועים היום! יום מעולה להגדיר משהו חדש ולמלא את היום. מה תיקבע? 😊",
+    "☕ יום פנוי! זה זמן מעולה לנשום, לתכנן, או פשוט לעשות משהו טוב לעצמך. היום שלך!",
+    "🚀 לוח של ולוחות! אין לך אירועים היום — זה בדיוק הזמן המתאים להציב משהו שאתה דוחה ארוך.",
+    "🌱 יום פנוי = הזדמנות שלך! תקבע פגישה, צא לאוויר, או פשוט תנוח קצת.",
+    "💪 אין אירועים היום, אבל היום הוא שלך! מרגיש כשרוצה לתכנן את השבוע הבא.",
+    "✨ יום ללא לוח זאתה מתנה קטנה! אולי זה הזמן לעשות משהו שמתמיד דחית אתה 🙂",
+]
 
 
 async def send_daily_briefing_job(bot: Bot) -> dict:
@@ -90,9 +103,18 @@ async def send_daily_briefing_job(bot: Bot) -> dict:
             formatted = calendar_service.format_today_events(events)
             
             if not formatted:
-                # No events today - don't spam
-                logger.info(f"[Briefing] User {user_id}: No events today, skipping")
-                skipped += 1
+                # No events today — send a motivational message instead of staying silent
+                nickname = user_data.get("personal_info", {}).get("nickname", "")
+                greeting = f"בוקר טוב{'  ' + nickname if nickname else ''}! ☀️"
+                motivation = random.choice(EMPTY_SCHEDULE_MESSAGES)
+                empty_msg = f"{greeting}\n{motivation}"
+
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=empty_msg
+                )
+                logger.info(f"[Briefing] ✨ Sent motivational message to user {user_id} (no events today)")
+                sent += 1
                 continue
             
             # Build and send message
