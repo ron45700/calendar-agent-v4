@@ -11,7 +11,9 @@ Classifies user input into:
 """
 
 import json
+import logging
 import asyncio
+import openai
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -94,28 +96,24 @@ class LLMService:
         # Build messages with history
         messages = []
         if history:
-            messages.extend(history[-10:])
+            messages.extend(history[-4:])
         messages.append({"role": "user", "content": text})
         
         try:
             # Call OpenAI with function calling - wrap with timeout
             try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        lambda: openai_service.client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                *messages
-                            ],
-                            functions=[INTENT_FUNCTION_SCHEMA],
-                            function_call={"name": "classify_user_intent"},
-                            temperature=0.4
-                        )
-                    ),
-                    timeout=25.0  # 25 second hard timeout
+                response = await openai_service.async_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        *messages
+                    ],
+                    functions=[INTENT_FUNCTION_SCHEMA],
+                    function_call={"name": "classify_user_intent"},
+                    temperature=0.4,
                 )
-            except asyncio.TimeoutError:
+            except openai.APITimeoutError as e:
+                logging.error(f"[LLM] Timeout error: {e}")
                 print("[LLM] ⚠️ OpenAI request timed out after 25 seconds!")
                 return {
                     "intent": "chat",

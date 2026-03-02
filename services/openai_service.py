@@ -8,7 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict
 
-from openai import OpenAI
+import openai
+from openai import OpenAI, AsyncOpenAI
 
 from config import OPENAI_API_KEY
 
@@ -25,6 +26,7 @@ class OpenAIService:
     def __init__(self):
         """Initialize OpenAI client."""
         self._client: Optional[OpenAI] = None
+        self._async_client: Optional[AsyncOpenAI] = None
     
     @property
     def client(self) -> OpenAI:
@@ -34,6 +36,24 @@ class OpenAIService:
                 raise ValueError("OPENAI_API_KEY not set in environment variables")
             self._client = OpenAI(api_key=OPENAI_API_KEY)
         return self._client
+
+    @property
+    def async_client(self) -> AsyncOpenAI:
+        """Lazy initialization of async OpenAI client.
+        
+        Timeout is set on the client itself (SDK best practice) so that
+        openai.APITimeoutError is raised, which participates in the SDK's
+        automatic retry logic (retried twice by default).
+        """
+        if self._async_client is None:
+            if not OPENAI_API_KEY:
+                raise ValueError("OPENAI_API_KEY not set in environment variables")
+            self._async_client = AsyncOpenAI(
+                api_key=OPENAI_API_KEY,
+                timeout=25.0,   # SDK-native timeout — raises openai.APITimeoutError
+                max_retries=2,  # default, made explicit for clarity
+            )
+        return self._async_client
     
     # =========================================================================
     # Whisper Transcription

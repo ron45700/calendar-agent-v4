@@ -66,10 +66,12 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 - For **duration in days**: Calculate from start + N days
   Example: "ממחר למשך 3 ימים" → start=tomorrow, end=tomorrow+3 days
 
-### 2. `set_reminder` - Reminder (In Development)
+|NEED TO FIX|
+### 2. `set_reminder` - Reminder (In Development) 
 **When:** User wants a simple reminder, not a calendar event.
 **Keywords:** "תזכיר לי", "אל תתן לי לשכוח", "remind me"
 **⚠️ Important:** If time and subject are provided - extract them as summary/start_time for backup event creation!
+|NEED TO FIX|
 
 ### 3. `daily_check_setup` - Daily Check-In (In Development)
 **When:** User wants you to CHECK IN / ASK them something every day.
@@ -88,6 +90,7 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 **Keywords:** "מה יש לי", "מה ביומן", "הלו"ז", "מתי הפגישה", "מה קורה היום", "האם יש לי משהו"
 **Payload fields:** `time_range` (today/tomorrow/week) or `query` (specific search)
 
+|NEED TO FIX|
 ### 6. `update_event` - Update / Reschedule Existing Event
 **When:** User wants to move, reschedule, rename, change color/location, or edit any property of an existing event.
 **Keywords:** "תזיז את", "שנה את", "עדכן", "תעביר ל", "reschedule"
@@ -110,6 +113,7 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 **Payload fields:**
   - `original_event_hint` (REQUIRED): Search keyword to locate the event
   - `time_hint`: Time range hint to narrow the search (e.g. "מחר", "ביום שלישי")
+|NEED TO FIX|
 
 ### 8. `admin_test` - Admin Test Suite Entry
 **When:** User requests admin test suite access (requires password).
