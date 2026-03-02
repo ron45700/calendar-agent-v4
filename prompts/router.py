@@ -66,12 +66,19 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 - For **duration in days**: Calculate from start + N days
   Example: "ממחר למשך 3 ימים" → start=tomorrow, end=tomorrow+3 days
 
-|NEED TO FIX|
-### 2. `set_reminder` - Reminder (In Development) 
-**When:** User wants a simple reminder, not a calendar event.
-**Keywords:** "תזכיר לי", "אל תתן לי לשכוח", "remind me"
-**⚠️ Important:** If time and subject are provided - extract them as summary/start_time for backup event creation!
-|NEED TO FIX|
+### 2. `set_reminder` — Reminder Request
+**When:** User says "תזכיר לי", "תזכורת", "אל תתן לי לשכוח", "remind me"
+**Action:** Always classify as `create_event` but set `original_intent: "set_reminder"` in the payload.
+  - The handler reads this field and applies prefix + color automatically based on the user’s `reminder_mode` setting.
+  - Extract `summary` (what to remember), `start_time`, and `end_time` exactly as you would for a normal event.
+  - Do NOT tell the user this is being stored as a calendar event — just confirm the reminder naturally.
+**Keywords:** "תזכיר לי", "תזכורת", "אל תתן לי לשכוח", "remind me"
+
+**Few-shot:**
+**User:** "תזכיר לי לקחת תרופות מחר ב-9"
+```json
+{{"intent": "create_event", "response_text": "סבב! רשמתי לך תזכורת למחר ב-09:00 ⏰", "payload": {{"summary": "לקחת תרופות", "start_time": "2026-03-04T09:00:00+02:00", "end_time": "2026-03-04T09:15:00+02:00", "category": "personal", "original_intent": "set_reminder"}}}}
+```
 
 ### 3. `daily_check_setup` - Daily Check-In (In Development)
 **When:** User wants you to CHECK IN / ASK them something every day.
@@ -436,6 +443,10 @@ INTENT_FUNCTION_SCHEMA = {
                     "daily_briefing": {
                         "type": "boolean",
                         "description": "Enable/disable daily morning briefing"
+                    },
+                    "reminder_mode": {
+                        "type": "boolean",
+                        "description": "Enable/disable reminder mode. When true, reminder requests get the prefix 'תזכורת: ' and orange color. Use for edit_preferences intent when user says 'תפעל מצב תזכורות' or 'כבה מצב תזכורות'."
                     },
                     
                     # Get events fields

@@ -146,7 +146,23 @@ async def process_create_event(
     """
     user_id = message.from_user.id
     user_contacts = user.get("contacts", {})
-    
+
+    # -------------------------------------------------------------------------
+    # Reminder Mode Enforcement
+    # If this create_event was originally a set_reminder intent AND the user
+    # has reminder_mode ON, apply: prefix "תזכורת: " + force Tangerine color.
+    # This is fully deterministic — no LLM involvement needed here.
+    # -------------------------------------------------------------------------
+    if payload.get("original_intent") == "set_reminder":
+        reminder_mode_on = user.get("preferences", {}).get("reminder_mode", False)
+        if reminder_mode_on:
+            current_summary = payload.get("summary", "")
+            if not current_summary.startswith("תזכורת: "):
+                payload["summary"] = f"תזכורת: {current_summary}"
+            # Force Tangerine (Orange) — the dedicated reminder color
+            payload["color_name"] = "tangerine"
+            logger.info(f"[Reminder] Mode ON — applied prefix + tangerine color to: {payload['summary']}")
+
     # Check for missing contacts
     attendee_names = payload.get("attendees", [])
     

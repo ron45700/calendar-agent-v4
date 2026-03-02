@@ -454,20 +454,11 @@ async def process_user_intent(
         await message.answer(events_response, parse_mode="Markdown")
     
     elif intent == "set_reminder":
-        logger.info(f"[Routing] -> set_reminder")
-        reminder_text = payload.get("reminder_text", "משהו")
-        
-        reminder_response = (
-            f"📝 *תזכורת נרשמה!*\n\n"
-            f"_{reminder_text}_\n\n"
-            f"_(פיצ'ר התזכורות בפיתוח - אזכיר לך בקרוב!)_"
-        )
-        logger.info(f"[Firestore] Saving assistant response")
-        firestore_service.save_message(user_id, "assistant", reminder_response)
-        
-        logger.info(f"📤 [Telegram] Sending response...")
-        await message.answer(reminder_response, parse_mode="Markdown")
-        logger.info(f"✅ [Telegram] Response sent!")
+        # set_reminder is always re-routed to create_event.
+        # The payload carries original_intent="set_reminder" so process_create_event
+        # can apply the reminder prefix + color based on the user's reminder_mode toggle.
+        logger.info(f"[Routing] -> set_reminder (re-routing to create_event)")
+        await process_create_event(message, user, state, payload, response_text)
     
     elif intent == "update_event":
         logger.info(f"[Routing] -> update_event")
@@ -493,6 +484,24 @@ async def process_user_intent(
             prefs_response = f"✅ דיווח יומי עודכן: **{status_text}**"
             if new_value:
                 prefs_response += "\nמחר ב-08:00 תקבל ממני סיכום של הלו\"ז שלך!"
+            handled = True
+
+        # Reminder mode toggle
+        elif "reminder_mode" in payload:
+            new_value = bool(payload["reminder_mode"])
+            firestore_service.update_user(user_id, {
+                "preferences.reminder_mode": new_value
+            })
+            if new_value:
+                prefs_response = (
+                    "✅ *מצב תזכורות הופעל!* 🔔\n\n"
+                    "מעכשיו כשתגיד \"תזכיר ליל\", אקבע אוטומטית \u05d0ירוע עם הקדימה *תזכורת: * ובצבע 👊 כתום."
+                )
+            else:
+                prefs_response = (
+                    "✅ *מצב תזכורות כבוי.* 😴\n\n"
+                    "תזכורות יישמרו כאירועי לוח רגילים ללא קידומת וללא צבע מיוחד."
+                )
             handled = True
         
         # Nickname change
