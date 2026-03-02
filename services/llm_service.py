@@ -132,8 +132,23 @@ class LLMService:
                 # Ensure payload exists
                 if "payload" not in result:
                     result["payload"] = {}
-                
-                # Resolve attendee names to emails for create_event
+
+                # ---- Multi-event batch: resolve attendees for each event ----
+                if "events_batch" in result and result["events_batch"] and contacts:
+                    for ev in result["events_batch"]:
+                        attendees = ev.get("attendees", [])
+                        if attendees:
+                            resolved = []
+                            for name in attendees:
+                                for contact_name, email in contacts.items():
+                                    if name.lower() in contact_name.lower() or contact_name.lower() in name.lower():
+                                        resolved.append({"name": contact_name, "email": email})
+                                        break
+                            ev["resolved_attendees"] = resolved
+                    print(f"[LLM] events_batch detected: {len(result['events_batch'])} events")
+                    return result
+
+                # ---- Single-event: resolve attendees for create_event ----
                 if result.get("intent") == "create_event" and contacts:
                     attendees = result.get("payload", {}).get("attendees", [])
                     if attendees:
@@ -144,7 +159,7 @@ class LLMService:
                                     resolved.append({"name": contact_name, "email": email})
                                     break
                         result["payload"]["resolved_attendees"] = resolved
-                
+
                 return result
             else:
                 # Fallback to chat intent

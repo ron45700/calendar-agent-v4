@@ -124,8 +124,126 @@ def resolve_attendee_emails(
 
 
 # =============================================================================
+# Multi-Event Creation (Batch Mode)
+# =============================================================================
+
+async def process_multi_event_creation(
+    message: Message,
+    user: UserData,
+    state: FSMContext,
+    events_batch: List[Dict[str, Any]],
+    response_text: str
+) -> None:
+    """
+    Process multiple events from a single user message (events_batch payload).
+
+    Creates events sequentially. Tracks successes and failures.
+    Sends one consolidated summary message at the end.
+
+    Design decisions:
+    - Events that require FSM pauses (missing contacts, no recurrence end date)
+      are skipped with a note — the user can create them individually.
+    - Auth errors on any event abort the remaining batch.
+    """
+    user_id = message.from_user.id
+    user_contacts = user.get("contacts", {})
+    tokens = get_user_tokens(user)
+
+    if not tokens:
+        await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        return
+
+    total = len(events_batch)
+    successes: List[str] = []   # Event titles that succeeded
+    failures: List[str] = []    # Event titles that failed
+
+    # Status message so the user knows work is in progress
+    status_msg = await message.answer(
+        f"⚡ *יוצר {total} אירועים...* רגע אחד!",
+        parse_mode="Markdown"
+    )
+
+    for ev_payload in events_batch:
+        summary = ev_payload.get("summary", "אירוע")
+
+        # Skip events that need FSM interaction (batch can't pause mid-flow)
+        attendee_names = ev_payload.get("attendees", [])
+        if attendee_names:
+            missing = find_missing_contacts(attendee_names, user_contacts)
+            if missing:
+                failures.append(
+                    f"❌ *{summary}* — חסר מייל של {missing[0]} "
+                    f"(צור ידנית עם /)\n_צור את האירוע ידנית כדי לספק את המייל_"
+                )
+                continue
+
+        if ev_payload.get("recurrence_freq") and not ev_payload.get("recurrence_end_date"):
+            failures.append(
+                f"⚠️ *{summary}* — אירוע חוזר ללא תאריך סיום "
+                f"(צור ידנית)"
+            )
+            continue
+
+        # Create the event
+        try:
+            create_result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda ev=ev_payload: calendar_service.create_event(
+                        tokens, ev, user_id=str(user_id)
+                    )
+                ),
+                timeout=12
+            )
+        except asyncio.TimeoutError:
+            failures.append(f"⏳ *{summary}* — timeout ב-Google Calendar")
+            continue
+        except Exception as e:
+            logger.error(f"[MultiEvent] Error creating '{summary}': {e}")
+            failures.append(f"❌ *{summary}* — שגיאה לא צפויה")
+            continue
+
+        if create_result.get("status") == "success":
+            created_ev = create_result.get("event", {})
+            start_raw = created_ev.get("start", {})
+            day_str = ""
+            if "dateTime" in start_raw:
+                try:
+                    dt = datetime.fromisoformat(start_raw["dateTime"])
+                    day_names = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+                    day_str = f" | {dt.strftime('%H:%M')} יום {day_names[dt.weekday()]}"
+                except Exception:
+                    pass
+            successes.append(f"✅ *{summary}*{day_str}")
+        elif create_result.get("type") == ERROR_AUTH_REQUIRED:
+            # Auth failure — abort remaining events
+            failures.append(f"🔐 *{summary}* — ההרשאה פגה, בוטלו שאר האירועים")
+            break
+        else:
+            failures.append(f"❌ *{summary}* — {create_result.get('message', 'שגיאה')}")
+
+    # Delete the in-progress status message
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    # Build summary
+    lines = [f"📋 *תוצאות יצירת {total} האירועים:*\n"]
+    lines.extend(successes)
+    if failures:
+        if successes:
+            lines.append("")  # blank separator
+        lines.extend(failures)
+
+    summary_msg = "\n".join(lines)
+    firestore_service.save_message(user_id, "assistant", summary_msg)
+    await message.answer(summary_msg, parse_mode="Markdown")
+
+
+# =============================================================================
 # Event Creation from Intent Payload
 # =============================================================================
+
 
 async def process_create_event(
     message: Message,

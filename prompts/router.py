@@ -137,6 +137,29 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 {{"intent": "get_events", "response_text": "מתי לבדוק? השבוע הזה או החודש כולו?", "payload": {{"entity_name": "עומר", "needs_clarification": true}}}}
 ```
 
+---
+
+### MULTI-EVENT CREATION
+
+When the user asks to create **more than one event in a single message**, use `events_batch` instead of `payload`.
+- Trigger words: "וגם", "ו-", "AND", "בנוסף", "כמו כן"
+- Each event is a fully independent object in the array.
+- Set `intent: "create_event"` and `payload: {}`.
+
+**Multi-event few-shot examples:**
+
+**User:** "תקבע אימון מחר ב-8 וגם ארוחת צהריים עם דני ביום רביעי ב-13"
+```json
+{{"intent": "create_event", "response_text": "מעולה! אני קובע 2 אירועים עבורך 🗓️", "payload": {{}}, "events_batch": [{{"summary": "אימון", "start_time": "2026-03-04T08:00:00+02:00", "end_time": "2026-03-04T09:00:00+02:00", "category": "sport"}}, {{"summary": "ארוחת צהריים עם דני", "start_time": "2026-03-06T13:00:00+02:00", "end_time": "2026-03-06T14:00:00+02:00", "category": "meeting", "attendees": ["דני"]}}]}}
+```
+
+**User:** "Schedule a dentist on Thursday at 10 and a team meeting on Friday at 15"
+```json
+{{"intent": "create_event", "response_text": "Got it! Creating 2 events for you 📅", "payload": {{}}, "events_batch": [{{"summary": "רופא שיניים", "start_time": "2026-03-05T10:00:00+02:00", "end_time": "2026-03-05T11:00:00+02:00", "category": "health"}}, {{"summary": "Team Meeting", "start_time": "2026-03-06T15:00:00+02:00", "end_time": "2026-03-06T16:00:00+02:00", "category": "meeting"}}]}}
+```
+
+---
+
 ### 6. `update_event` - Update / Reschedule Existing Event
 **When:** User wants to move, reschedule, rename, change color/location, or edit any property of an existing event.
 **Keywords:** "תזיז את", "שנה את", "עדכן", "תעביר ל", "reschedule"
@@ -546,6 +569,34 @@ INTENT_FUNCTION_SCHEMA = {
                         "type": "string",
                         "description": "Time range hint to narrow search for delete_event (e.g. 'tomorrow', 'next week')"
                     }
+                    }
+                }
+            }
+        },
+        "events_batch": {
+            "type": "array",
+            "description": "Use ONLY when the user requests multiple distinct events in ONE message (e.g. 'workout tomorrow at 8 AND lunch on Wednesday at 13'). Each item is an event object identical to `payload`. When using events_batch, set intent to 'create_event' and leave `payload` as empty object {}.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "start_time": {"type": "string"},
+                    "end_time": {"type": "string"},
+                    "attendees": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["work", "meeting", "personal", "sport", "study", "health", "family", "fun", "general"]
+                    },
+                    "color_name": {
+                        "type": "string",
+                        "enum": ["lavender", "sage", "grape", "flamingo", "banana", "tangerine", "peacock", "graphite", "blueberry", "basil", "tomato"]
+                    },
+                    "location": {"type": "string"},
+                    "is_all_day": {"type": "boolean"},
+                    "original_intent": {"type": "string"}
                 }
             }
         },

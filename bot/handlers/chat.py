@@ -30,7 +30,7 @@ from services.openai_service import openai_service
 from services.llm_service import llm_service
 from services.firestore_service import firestore_service
 from bot.utils import get_random_thinking_phrase, get_formatted_current_time
-from bot.handlers.events import process_create_event, process_update_event, process_delete_event
+from bot.handlers.events import process_create_event, process_update_event, process_delete_event, process_multi_event_creation
 from services.calendar_service import calendar_service
 from utils.performance import measure_time
 from config import ADMIN_PASSWORD, ADMIN_TEST_ENABLED
@@ -402,7 +402,12 @@ async def process_user_intent(
     
     if intent == "create_event":
         logger.info(f"[Routing] -> create_event")
-        await process_create_event(message, user, state, payload, response_text)
+        events_batch = result.get("events_batch", [])
+        if events_batch:
+            logger.info(f"[Routing] -> multi-event batch ({len(events_batch)} events)")
+            await process_multi_event_creation(message, user, state, events_batch, response_text)
+        else:
+            await process_create_event(message, user, state, payload, response_text)
     
     elif intent == "get_events":
         logger.info(f"[Routing] -> get_events")
