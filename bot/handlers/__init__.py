@@ -14,6 +14,7 @@ from aiogram import Router
 from .commands import router as commands_router
 from .onboarding import router as onboarding_router
 from .events import router as events_router
+from .search import router as search_router
 from .chat import router as chat_router
 from .admin_tests import router as admin_tests_router
 
@@ -28,6 +29,7 @@ router.include_router(admin_tests_router)
 router.include_router(commands_router)
 router.include_router(onboarding_router)
 router.include_router(events_router)
+router.include_router(search_router)
 router.include_router(chat_router)
 
 __all__ = ["router"]

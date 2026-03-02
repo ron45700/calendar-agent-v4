@@ -92,12 +92,51 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 **When:** User wants to change name, colors, contacts.
 **Keywords:** "קרא לי", "שנה את השם", "הוסף איש קשר", "צבע"
 
-### 5. `get_events` - Query Calendar / Check Schedule
+### 5. `get_events` — Query Calendar / Check Schedule
 **When:** User wants to see their schedule, find events, or check what's coming up.
 **Keywords:** "מה יש לי", "מה ביומן", "הלו"ז", "מתי הפגישה", "מה קורה היום", "האם יש לי משהו"
-**Payload fields:** `time_range` (today/tomorrow/week) or `query` (specific search)
 
-|NEED TO FIX|
+**Date Range — always extract `date_from` + `date_to` (ISO YYYY-MM-DD):**
+- "השבוע" / "this week" → Monday–Sunday of current week
+- "סוף שבוע" / "weekend" → coming Friday+Saturday
+- "החודש" / "this month" → 1st to last day of current month
+- "יוי" / "June" → 2026-06-01 to 2026-06-30
+- "בין 20-30 ביוני" → date_from=2026-06-20, date_to=2026-06-30
+- "היום" → date_from=today, date_to=today (use `time_range: "today"` as well)
+- "מחר" → date_from=tomorrow, date_to=tomorrow
+
+**Entity Search — set `entity_name` when user asks about a person/place:**
+- "האם יש לי פגישות עם דני?" → entity_name="דני"
+- "מתי הפגישה עם רון?" → entity_name="רון"
+- "יש לי קונצרטים במרץ?" → entity_name="קונצרט", date_from=2026-03-01, date_to=2026-03-31
+
+**Proactive Clarification — set `needs_clarification: true` when NO timeframe given:**
+- "האם יש לי פגישות עם דני?" (no date) → needs_clarification=true, entity_name="דני"
+- "מה יש לי עם עומר?" (no date) → needs_clarification=true, entity_name="עומר"
+- Do NOT set needs_clarification when user says "today", "tomorrow", "this week", "this month", or any specific date.
+
+**Few-shot examples:**
+
+**User:** "מה יש לי היום?"
+```json
+{{"intent": "get_events", "response_text": "בודק מה יש לך היום...", "payload": {{"time_range": "today", "date_from": "2026-03-03", "date_to": "2026-03-03"}}}}
+```
+
+**User:** "מה יש לי בסוף השבוע?"
+```json
+{{"intent": "get_events", "response_text": "בודק מה יש לך בסוף השבוע...", "payload": {{"time_range": "week", "date_from": "2026-03-06", "date_to": "2026-03-07"}}}}
+```
+
+**User:** "האם יש לי משהו עם דני השבוע?"
+```json
+{{"intent": "get_events", "response_text": "מחפש אירועים עם דני השבוע...", "payload": {{"time_range": "week", "entity_name": "דני", "date_from": "2026-03-02", "date_to": "2026-03-08"}}}}
+```
+
+**User:** "האם יש לי פגישות עם עומר?" (no date)
+```json
+{{"intent": "get_events", "response_text": "מתי לבדוק? השבוע הזה או החודש כולו?", "payload": {{"entity_name": "עומר", "needs_clarification": true}}}}
+```
+
 ### 6. `update_event` - Update / Reschedule Existing Event
 **When:** User wants to move, reschedule, rename, change color/location, or edit any property of an existing event.
 **Keywords:** "תזיז את", "שנה את", "עדכן", "תעביר ל", "reschedule"
@@ -453,7 +492,23 @@ INTENT_FUNCTION_SCHEMA = {
                     "time_range": {
                         "type": "string",
                         "enum": ["today", "tomorrow", "week", "month"],
-                        "description": "Time range for calendar query"
+                        "description": "Predefined time range for calendar query"
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "ISO date (YYYY-MM-DD) start of custom range. Set for any specific date or range query."
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "ISO date (YYYY-MM-DD) end of custom range (inclusive). Set alongside date_from."
+                    },
+                    "entity_name": {
+                        "type": "string",
+                        "description": "Person or keyword to search for within event titles/attendees (e.g. 'Danny', 'concert')"
+                    },
+                    "needs_clarification": {
+                        "type": "boolean",
+                        "description": "Set true when user asks about events but provides NO timeframe. Bot will ask before searching."
                     },
                     "query": {"type": "string", "description": "Specific search query for events"},
                     

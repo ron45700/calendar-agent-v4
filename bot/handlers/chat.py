@@ -406,41 +406,156 @@ async def process_user_intent(
     
     elif intent == "get_events":
         logger.info(f"[Routing] -> get_events")
-        
-        # Get user tokens
+
         tokens = user.get("calendar_config", {})
-        time_range = payload.get("time_range", "today")
-        
+        payload_data = payload  # use local alias to avoid shadowing outer `payload`
+
+        # --- Proactive Clarification: ask before searching if no timeframe given ---
+        if payload_data.get("needs_clarification"):
+            entity_name = payload_data.get("entity_name", "")
+            await state.update_data(
+                search_entity=entity_name,
+                search_response_text=response_text
+            )
+            from bot.states import SearchFlowStates
+            await state.set_state(SearchFlowStates.WAITING_FOR_TIMEFRAME)
+
+            clarify_msg = (
+                f"🔍 מחפש אירועים{f' עם {entity_name}' if entity_name else ''}.\n\n"
+                f"באיזה טווח למחפש? 📅\n"
+                f"• *השבוע הזה*\n"
+                f"• *החודש הזה*\n"
+                f"• *תאריך ספציפי* (כתוב תאריך)"
+            )
+            firestore_service.save_message(user_id, "assistant", clarify_msg)
+            await message.answer(clarify_msg, parse_mode="Markdown")
+            return
+
+        # --- Build time window from payload fields ---
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+        ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+        today = datetime.now(ISRAEL_TZ).date()
+
+        date_from_str = payload_data.get("date_from")
+        date_to_str = payload_data.get("date_to")
+        time_range = payload_data.get("time_range", "")
+        entity_name = payload_data.get("entity_name", "")
+
+        # Derive time_min / time_max
+        if date_from_str and date_to_str:
+            try:
+                from datetime import date as date_cls
+                d_from = date_cls.fromisoformat(date_from_str)
+                d_to = date_cls.fromisoformat(date_to_str)
+                time_min = datetime(d_from.year, d_from.month, d_from.day, tzinfo=ISRAEL_TZ).isoformat()
+                time_max = datetime(d_to.year, d_to.month, d_to.day, 23, 59, 59, tzinfo=ISRAEL_TZ).isoformat()
+            except Exception:
+                time_min = time_max = None
+        else:
+            time_min = time_max = None  # calendar_service will use defaults (today → +30d)
+
         try:
-            # Fetch events with timeout protection
-            if time_range == "today":
+            # --- Entity search: use search_events() for targeted queries ---
+            if entity_name:
                 result = await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(
-                        None, lambda: calendar_service.get_today_events(tokens, user_id=str(user_id))
+                        None, lambda: calendar_service.search_events(
+                            tokens,
+                            query=entity_name,
+                            time_min=time_min,
+                            time_max=time_max,
+                            max_results=15,
+                            user_id=str(user_id)
+                        )
                     ), timeout=10
                 )
-            else:
-                result = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None, lambda: calendar_service.get_upcoming_events(tokens, max_results=10, user_id=str(user_id))
-                    ), timeout=10
-                )
-            
-            if result.get("status") != "success":
-                error_type = result.get("type", "")
-                if error_type == "auth_required":
-                    events_response = "🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש."
+
+                events = result.get("events", []) if result.get("status") == "success" else []
+
+                # --- Fuzzy fallback: expand ±2 days if nothing found in exact range ---
+                if not events and time_min and time_max:
+                    logger.info(f"[Search] No results for '{entity_name}', expanding ±2 days")
+                    from datetime import timedelta as td
+                    expanded_min = (datetime.fromisoformat(time_min) - td(days=2)).isoformat()
+                    expanded_max = (datetime.fromisoformat(time_max) + td(days=2)).isoformat()
+                    expanded_result = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: calendar_service.search_events(
+                                tokens,
+                                query=entity_name,
+                                time_min=expanded_min,
+                                time_max=expanded_max,
+                                max_results=15,
+                                user_id=str(user_id)
+                            )
+                        ), timeout=10
+                    )
+                    events = expanded_result.get("events", []) if expanded_result.get("status") == "success" else []
+                    if events:
+                        # Prepend a notice that we widened the search
+                        events_response = f"🔍 לא מצאתי '{entity_name}' בטווח שביקשת, אבל מצאתי בתאריכים קרובים:\n\n"
+                        events_response += calendar_service.format_search_results(events, entity_name)
+                    else:
+                        # Still nothing — suggest upcoming events
+                        upcoming = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, lambda: calendar_service.get_upcoming_events(
+                                    tokens, max_results=3, user_id=str(user_id)
+                                )
+                            ), timeout=10
+                        )
+                        upcoming_events = upcoming.get("events", []) if upcoming.get("status") == "success" else []
+                        events_response = f"🔍 לא מצאתי אירועים עם '{entity_name}'.\n\n"
+                        if upcoming_events:
+                            formatted_upcoming = calendar_service.format_today_events(upcoming_events)
+                            events_response += f"אבל הנה מה שמגיע בקרוב:\n{formatted_upcoming}"
+                        else:
+                            events_response += "גם אין אירועים קרובים אחרים."
                 else:
-                    events_response = "❌ שגיאה בגישה ליומן. נסה שוב בעוד כמה דקות."
+                    if events:
+                        events_response = f"📅 *אירועים עם {entity_name}:*\n\n"
+                        events_response += calendar_service.format_search_results(events, entity_name)
+                    else:
+                        events_response = f"🔍 לא מצאתי אירועים עם '{entity_name}' בטווח הזמן המבוקש."
+
+            # --- Standard schedule fetch (no entity) ---
             else:
-                events = result.get("events", [])
-                formatted = calendar_service.format_today_events(events)
-                if formatted:
-                    range_label = "היום" if time_range == "today" else "הקרובים"
-                    events_response = f"📅 *האירועים שלך ל{range_label}:*\n\n{formatted}"
+                if time_range == "today" or (not time_range and not date_from_str):
+                    result = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: calendar_service.get_today_events(tokens, user_id=str(user_id))
+                        ), timeout=10
+                    )
+                    range_label = "היום"
                 else:
-                    events_response = "📅 אין אירועים מתוכננים! 🎉\nהיום שלך פנוי."
-        
+                    result = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: calendar_service.get_upcoming_events(
+                                tokens, max_results=15, user_id=str(user_id),
+                                time_min=time_min, time_max=time_max
+                            )
+                        ), timeout=10
+                    )
+                    range_label = {
+                        "tomorrow": "מחר", "week": "השבוע", "month": "החודש"
+                    }.get(time_range, "הקרובים")
+                    if date_from_str and date_to_str and date_from_str != date_to_str:
+                        range_label = f"{date_from_str} עד {date_to_str}"
+
+                if result.get("status") != "success":
+                    if result.get("type") == "auth_required":
+                        events_response = "🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש."
+                    else:
+                        events_response = "❌ שגיאה בגישה ליומן. נסה שוב בעוד כמה דקות."
+                else:
+                    events = result.get("events", [])
+                    formatted = calendar_service.format_today_events(events)
+                    if formatted:
+                        events_response = f"📅 *האירועים שלך ל{range_label}:*\n\n{formatted}"
+                    else:
+                        events_response = f"📅 אין אירועים מתוכננים ל{range_label}! 🎉 היום שלך פנוי."
+
         except asyncio.TimeoutError:
             logger.error(f"❌ [Calendar] Timeout fetching events for user {user_id}")
             events_response = "⏳ Google Calendar לא הגיב בזמן.\nנסה שוב בעוד רגע."
@@ -449,7 +564,7 @@ async def process_user_intent(
             import traceback
             traceback.print_exc()
             events_response = "❌ שגיאה בשליפת האירועים. נסה שוב."
-        
+
         firestore_service.save_message(user_id, "assistant", events_response)
         await message.answer(events_response, parse_mode="Markdown")
     

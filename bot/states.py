@@ -89,6 +89,15 @@ class RecurrenceFlowStates(StatesGroup):
     WAITING_FOR_END_CONDITION = State()
 
 
+class SearchFlowStates(StatesGroup):
+    """
+    States for the advanced search clarification flow.
+    When the user asks to search without a timeframe (e.g. "do I have meetings
+    with Danny?"), the bot asks "this week or this month?" and waits here.
+    """
+    WAITING_FOR_TIMEFRAME = State()
+
+
 class AdminTestStates(StatesGroup):
     """
     States for Admin Test Suite.
@@ -118,3 +127,4 @@ class AdminTestStates(StatesGroup):
     
     # Test 5: Dry-Run Event
     DRY_RUN_EVENT = State()
+

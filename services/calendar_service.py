@@ -422,7 +422,9 @@ class CalendarService:
         user_tokens: Dict[str, str],
         max_results: int = 10,
         calendar_id: str = "primary",
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        time_min: Optional[str] = None,
+        time_max: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Get upcoming events from user's calendar.
@@ -447,10 +449,12 @@ class CalendarService:
         
         try:
             now = datetime.utcnow().isoformat() + "Z"
-            
+            effective_time_min = time_min if time_min else now
+
             events_result = service.events().list(
                 calendarId=calendar_id,
-                timeMin=now,
+                timeMin=effective_time_min,
+                timeMax=time_max,
                 maxResults=max_results,
                 singleEvents=True,
                 orderBy="startTime"
@@ -908,6 +912,83 @@ class CalendarService:
             return None
         
         return "\n\n".join(lines)
+
+
+    def format_search_results(self, events: List[Dict], entity_name: str = "") -> str:
+        """
+        Format search results beautifully, grouped by day.
+
+        Shows full event details (title, time, location, attendees) for each result.
+        Used by the advanced get_events search path.
+
+        Args:
+            events: List of Google Calendar event dicts
+            entity_name: The search term (used in empty-result message)
+
+        Returns:
+            Formatted multi-line string
+        """
+        if not events:
+            return f"לא נמצאו אירועים{f' עם {entity_name}' if entity_name else ''}."
+
+        day_groups: Dict[str, List] = {}
+
+        for event in events:
+            start_raw = event.get("start", {})
+            if "dateTime" in start_raw:
+                dt = datetime.fromisoformat(start_raw["dateTime"])
+                day_key = dt.strftime("%A, %d/%m")  # e.g. "Monday, 10/03"
+                day_names_heb = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+                day_label = f"יום {day_names_heb[dt.weekday()]} {dt.strftime('%d/%m')}"
+            elif "date" in start_raw:
+                day_key = start_raw["date"]
+                day_label = day_key
+            else:
+                day_key = "?"
+                day_label = "?"
+
+            if day_key not in day_groups:
+                day_groups[day_key] = {"label": day_label, "events": []}
+            day_groups[day_key]["events"].append(event)
+
+        output_lines = [f"📊 *נמצאו {len(events)} אירועים:*\n"]
+
+        for day_key in sorted(day_groups.keys()):
+            group = day_groups[day_key]
+            output_lines.append(f"📅 *{group['label']}*")
+
+            for event in group["events"]:
+                summary = event.get("summary", "אירוע ללא שם")
+                color_id = str(event.get("colorId", ""))
+                emoji = COLOR_ID_EMOJI.get(color_id, DEFAULT_EVENT_EMOJI)
+
+                start_raw = event.get("start", {})
+                if "dateTime" in start_raw:
+                    end_raw = event.get("end", {})
+                    st = datetime.fromisoformat(start_raw["dateTime"])
+                    et = datetime.fromisoformat(end_raw.get("dateTime", start_raw["dateTime"]))
+                    time_str = f"{st.strftime('%H:%M')} - {et.strftime('%H:%M')}"
+                else:
+                    time_str = "כל היום"
+
+                event_lines = [f"{emoji} *{summary}* | ⏰ {time_str}"]
+
+                location = event.get("location", "")
+                if location:
+                    event_lines.append(f"   📍 {location}")
+
+                attendees = event.get("attendees", [])
+                if attendees:
+                    att_names = ", ".join(
+                        a.get("displayName", a.get("email", "")) for a in attendees[:4]
+                    )
+                    event_lines.append(f"   👥 {att_names}")
+
+                output_lines.append("\n".join(event_lines))
+
+            output_lines.append("")  # blank line between days
+
+        return "\n".join(output_lines).rstrip()
 
 
 # Singleton instance
