@@ -63,8 +63,12 @@ class LLMService:
         contact_names = list(contacts.keys()) if contacts else []
         contacts_str = ", ".join(contact_names) if contact_names else "אין אנשי קשר"
         
-        # Format preferences
-        prefs_str = json.dumps(user_preferences, ensure_ascii=False) if user_preferences else "{}"
+        # Format preferences — use 'none' string instead of '{}' to avoid
+        # Python .format() interpreting bare {} as a positional placeholder
+        if user_preferences:
+            prefs_str = json.dumps(user_preferences, ensure_ascii=False)
+        else:
+            prefs_str = "none"
         
         # Build BASE prompt (Personality & Guardrails)
         base_prompt = BASE_SYSTEM_PROMPT.format(
@@ -86,7 +90,7 @@ class LLMService:
         # Combine: Personality + Router Logic
         # Extract color map from user_preferences (already passed by caller)
         color_map = user_preferences.get("color_map", {}) if user_preferences else {}
-        colors_str = json.dumps(color_map, ensure_ascii=False) if color_map else "{}"
+        colors_str = json.dumps(color_map, ensure_ascii=False) if color_map else "none"
 
         # Inject agent name into the chat prompt safely
         chat_prompt_ready = CHAT_PROMPT.replace("{agent_name}", agent_name)
