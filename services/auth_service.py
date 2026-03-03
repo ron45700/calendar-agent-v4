@@ -6,6 +6,10 @@ Handles authorization URL generation, token exchange, and refresh.
 from typing import Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta
 import json
+import os
+import hashlib
+import base64
+import secrets
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -39,58 +43,90 @@ class AuthService:
     
     def generate_auth_url(self, user_id: int) -> str:
         """
-        Generate Google OAuth2 authorization URL.
-        
+        Generate Google OAuth2 authorization URL with PKCE.
+
+        Generates a PKCE code_verifier + code_challenge pair (RFC 7636)
+        and persists the verifier to Firestore so it survives across Cloud Run
+        container instances.
+
         Args:
-            user_id: Telegram user ID (used as state parameter)
-            
+            user_id: Telegram user ID (used as OAuth state parameter)
+
         Returns:
             Authorization URL for the user to visit
         """
+        from services.firestore_service import firestore_service
+
         flow = Flow.from_client_config(
             self.client_config,
             scopes=GOOGLE_SCOPES,
             redirect_uri=GOOGLE_REDIRECT_URI
         )
-        
-        # Generate URL with offline access and consent prompt
-        # access_type='offline' ensures we get a refresh token
-        # prompt='consent' forces consent screen to get refresh token even on re-auth
+
+        # --- PKCE (RFC 7636) ---
+        # Generate a high-entropy code_verifier (43-128 URL-safe chars)
+        code_verifier = secrets.token_urlsafe(64)  # 86 chars after base64
+
+        # code_challenge = BASE64URL(SHA256(ASCII(code_verifier)))
+        digest = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+        code_challenge = base64.urlsafe_b64encode(digest).rstrip(b'=').decode('utf-8')
+
+        # Persist verifier to Firestore BEFORE redirecting — survives container restarts
+        firestore_service.save_pkce_verifier(user_id, code_verifier)
+
         auth_url, _ = flow.authorization_url(
             access_type='offline',
             prompt='consent',
-            state=str(user_id),  # Pass user_id as state for callback
-            include_granted_scopes='true'
+            state=str(user_id),
+            include_granted_scopes='true',
+            code_challenge=code_challenge,
+            code_challenge_method='S256'
         )
-        
-        print(f"[AuthService] Generated auth URL for user {user_id}")
+
+        print(f"[AuthService] Generated auth URL with PKCE for user {user_id}")
         return auth_url
     
-    def exchange_code(self, code: str) -> Tuple[str, str, datetime]:
+    def exchange_code(self, code: str, user_id: Optional[int] = None) -> Tuple[str, str, datetime]:
         """
         Exchange authorization code for access and refresh tokens.
-        
+
+        Retrieves the PKCE code_verifier persisted in Firestore during URL
+        generation, passes it to fetch_token(), and then clears it from Firestore.
+
         Args:
             code: Authorization code from OAuth callback
-            
+            user_id: Telegram user ID — required to retrieve the PKCE verifier
+
         Returns:
             Tuple of (access_token, refresh_token, expiry_datetime)
-            
+
         Raises:
             Exception: If code exchange fails
         """
+        from services.firestore_service import firestore_service
+
         flow = Flow.from_client_config(
             self.client_config,
             scopes=GOOGLE_SCOPES,
             redirect_uri=GOOGLE_REDIRECT_URI
         )
-        
-        # Exchange code for credentials
-        flow.fetch_token(code=code)
+
+        # Retrieve PKCE verifier from Firestore (also deletes it atomically)
+        code_verifier = None
+        if user_id is not None:
+            code_verifier = firestore_service.get_and_clear_pkce_verifier(user_id)
+
+        if code_verifier:
+            print(f"[AuthService] Using PKCE verifier for user {user_id}")
+            flow.fetch_token(code=code, code_verifier=code_verifier)
+        else:
+            # Fallback: no verifier found (e.g. legacy re-auth without PKCE)
+            print(f"[AuthService] No PKCE verifier found for user {user_id}, proceeding without")
+            flow.fetch_token(code=code)
+
         credentials = flow.credentials
-        
         print(f"[AuthService] Exchanged code for tokens, expiry: {credentials.expiry}")
-        
+
         return (
             credentials.token,
             credentials.refresh_token,

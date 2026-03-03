@@ -249,7 +249,68 @@ class FirestoreService:
             "pending_command.timestamp": None
         })
         print(f"[Firestore] Cleared pending command for user {user_id}")
-    
+
+    # =========================================================================
+    # PKCE Verifier Storage (OAuth2 Cloud Run Stateless Fix)
+    # =========================================================================
+
+    def save_pkce_verifier(self, user_id: int, code_verifier: str) -> None:
+        """
+        Persist the PKCE code_verifier to Firestore before redirecting to Google.
+
+        Cloud Run is stateless — the code_verifier generated during the auth URL
+        request would be lost when Google redirects to a fresh container instance.
+        Storing it in Firestore ensures it survives across requests.
+
+        Args:
+            user_id: Telegram user ID (also used as OAuth state)
+            code_verifier: The PKCE code verifier string
+        """
+        # Use set with merge=True so this works even for users not yet created
+        self._user_ref(user_id).set(
+            {
+                "_pkce": {
+                    "code_verifier": code_verifier,
+                    "created_at": datetime.utcnow().isoformat()
+                }
+            },
+            merge=True
+        )
+        print(f"[Firestore] Saved PKCE verifier for user {user_id}")
+
+    def get_and_clear_pkce_verifier(self, user_id: int) -> Optional[str]:
+        """
+        Retrieve the PKCE code_verifier from Firestore and immediately delete it.
+
+        This is called once during the OAuth callback. The verifier is a one-time
+        value — after retrieval it is removed to keep Firestore clean.
+
+        Args:
+            user_id: Telegram user ID
+
+        Returns:
+            code_verifier string if found, None otherwise
+        """
+        doc = self._user_ref(user_id).get()
+        if not doc.exists:
+            print(f"[Firestore] No user doc found for PKCE verifier (user {user_id})")
+            return None
+
+        data = doc.to_dict() or {}
+        pkce = data.get("_pkce", {})
+        verifier = pkce.get("code_verifier")
+
+        if verifier:
+            # Remove the temporary _pkce field using DELETE_FIELD sentinel
+            from google.cloud.firestore_v1 import DELETE_FIELD
+            self._user_ref(user_id).update({"_pkce": DELETE_FIELD})
+            print(f"[Firestore] Retrieved and cleared PKCE verifier for user {user_id}")
+        else:
+            print(f"[Firestore] No PKCE verifier found for user {user_id}")
+
+        return verifier
+
+
     # =========================================================================
     # State Management
     # =========================================================================

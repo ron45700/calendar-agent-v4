@@ -569,7 +569,6 @@ INTENT_FUNCTION_SCHEMA = {
                         "type": "string",
                         "description": "Time range hint to narrow search for delete_event (e.g. 'tomorrow', 'next week')"
                     }
-                    }
                 }
             }
         },

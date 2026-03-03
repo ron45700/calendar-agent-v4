@@ -86,8 +86,8 @@ async def oauth_callback(request: web.Request) -> web.Response:
         )
     
     try:
-        # Exchange code for tokens
-        access_token, refresh_token, token_expiry = auth_service.exchange_code(code)
+        # Exchange code for tokens (pass user_id so PKCE verifier can be retrieved)
+        access_token, refresh_token, token_expiry = auth_service.exchange_code(code, user_id=user_id)
         print(f"[OAuth Callback] Got tokens for user {user_id}")
         
         # Check if user exists (re-auth) or is new
