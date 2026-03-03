@@ -31,6 +31,7 @@ from services.llm_service import llm_service
 from services.firestore_service import firestore_service
 from bot.utils import get_random_thinking_phrase, get_formatted_current_time
 from bot.handlers.events import process_create_event, process_update_event, process_delete_event, process_multi_event_creation
+from bot.handlers.onboarding import send_onboarding_intro
 from services.calendar_service import calendar_service
 from utils.performance import measure_time
 from config import ADMIN_PASSWORD, ADMIN_TEST_ENABLED
@@ -408,7 +409,85 @@ async def process_user_intent(
             await process_multi_event_creation(message, user, state, events_batch, response_text)
         else:
             await process_create_event(message, user, state, payload, response_text)
-    
+
+    elif intent == "start_onboarding":
+        logger.info(f"[Routing] -> start_onboarding")
+        await state.clear()  # clear any active FSM state before starting fresh
+        firestore_service.save_message(user_id, "assistant", response_text)
+        await message.answer(response_text)  # send LLM's warm acknowledgement first
+        await send_onboarding_intro(message, state)
+
+    elif intent == "show_preferences":
+        logger.info(f"[Routing] -> show_preferences")
+
+        personal = user.get("personal_info", {})
+        nickname = personal.get("nickname") or personal.get("name") or "לא נקבע"
+        agent_name = personal.get("agent_nickname") or personal.get("agent_name") or "לא נקבע"
+
+        contacts = user.get("contacts", {})
+        color_map = user.get("calendar_config", {}).get("color_map", {})
+        prefs = user.get("preferences", {})
+        reminder_mode = prefs.get("reminder_mode", False)
+        daily_briefing = prefs.get("daily_briefing", False)
+
+        # --- Color ID → Hebrew name map ---
+        COLOR_ID_HEBREW = {
+            "1": "לבנדר", "2": "מרווה", "3": "סגול",
+            "4": "פלמינגו", "5": "בננה", "6": "כתום",
+            "7": "תכלת", "8": "אפור כהה", "9": "כחול",
+            "10": "ירוק", "11": "אדום",
+        }
+        CATEGORY_HEB = {
+            "work": "עבודה", "meeting": "פגישות", "personal": "אישי",
+            "sport": "ספורט", "study": "לימודים", "health": "בריאות",
+            "family": "משפחה", "fun": "בילויים", "general": "כללי",
+        }
+
+        # --- Build message ---
+        lines = [
+            f"📤 *הפרופיל שלך*",
+            "",
+            f"👤 *השם שלך:* {nickname}",
+            f"🤖 *שם הבוט:* {agent_name}",
+        ]
+
+        # Daily features
+        lines += [
+            "",
+            f"☀️ *הצגת הלוז בבוקר:* {'\u05deופעל ✅' if daily_briefing else 'כבוי 🔕'}",
+            f"🔔 *הוספת 'תזכורת' לאירועים:* {'\u05deופעל ✅' if reminder_mode else 'כבוי 🔕'}",
+        ]
+
+        # Contacts
+        lines.append("")
+        if contacts:
+            lines.append(f"👥 *אנשי קשר ({len(contacts)}):*")
+            for name, email in contacts.items():
+                lines.append(f"  • {name} — `{email}`")
+        else:
+            lines.append("👥 *אנשי קשר:* לא נוספו עדיין")
+
+        # Custom colors
+        lines.append("")
+        custom_colors = {k: v for k, v in color_map.items() if not k.startswith("_")}
+        if custom_colors:
+            lines.append("🎨 *צבעי קטגוריה:*")
+            for cat, cid in custom_colors.items():
+                cat_heb = CATEGORY_HEB.get(cat, cat)
+                color_heb = COLOR_ID_HEBREW.get(str(cid), str(cid))
+                lines.append(f"  • {cat_heb} → {color_heb}")
+        else:
+            lines.append("🎨 *צבעים:* ברירת מחדל לכלה (תכלת)")
+
+        lines += [
+            "",
+            "💡 _לשנות הגדרות פשוט תגיד לי מה לשנות!_",
+        ]
+
+        pref_msg = "\n".join(lines)
+        firestore_service.save_message(user_id, "assistant", pref_msg)
+        await message.answer(pref_msg, parse_mode="Markdown")
+
     elif intent == "get_events":
         logger.info(f"[Routing] -> get_events")
 

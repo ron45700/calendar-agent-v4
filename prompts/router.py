@@ -89,8 +89,24 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 **⚠️ Important:** Extract details in case we can create backup events.
 
 ### 4. `edit_preferences` - Change Settings
-**When:** User wants to change name, colors, contacts.
+**When:** User wants to **change** name, colors, contacts, or any setting.
 **Keywords:** "קרא לי", "שנה את השם", "הוסף איש קשר", "צבע"
+
+### 5. `show_preferences` - View Current Settings
+**When:** User wants to **see/view** their current saved settings, not change them.
+**Keywords:** "מה ההגדרות שלי", "הצג הגדרות", "העדפות", "מה שמרת עליי", "פרופיל שלי", "מידע שלי", "אנשי קשר שלי", "show settings"
+**Important:** Use `edit_preferences` when the user wants to CHANGE a setting. Use `show_preferences` when they want to VIEW what was saved.
+
+**Few-shot:**
+**User:** "תראה לי את ההגדרות שלי"
+```json
+{{"intent": "show_preferences", "response_text": "בטח! הנה כל מה ששמרתי עלייך 📣", "payload": {{}}}}
+```
+
+**User:** "מה הפרטים שיש לך עליי?"
+```json
+{{"intent": "show_preferences", "response_text": "בוא נפתח את הפרופיל שלך! 👤", "payload": {{}}}}
+```
 
 ### 5. `get_events` — Query Calendar / Check Schedule
 **When:** User wants to see their schedule, find events, or check what's coming up.
@@ -144,7 +160,7 @@ Set `is_all_day: true` in the payload when ANY of the following apply:
 When the user asks to create **more than one event in a single message**, use `events_batch` instead of `payload`.
 - Trigger words: "וגם", "ו-", "AND", "בנוסף", "כמו כן"
 - Each event is a fully independent object in the array.
-- Set `intent: "create_event"` and `payload: {}`.
+- Set `intent: "create_event"` and `payload: {{}}`.
 
 **Multi-event few-shot examples:**
 
@@ -182,14 +198,29 @@ When the user asks to create **more than one event in a single message**, use `e
 **Payload fields:**
   - `original_event_hint` (REQUIRED): Search keyword to locate the event
   - `time_hint`: Time range hint to narrow the search (e.g. "מחר", "ביום שלישי")
-|NEED TO FIX|
 
 ### 8. `admin_test` - Admin Test Suite Entry
 **When:** User requests admin test suite access (requires password).
 **Keywords:** "admin_test", "טסט אדמין"
 **Note:** This intent is handled before LLM classification in chat.py for efficiency.
 
-### 9. `chat` - General Conversation
+### 9. `start_onboarding` - Restart Onboarding Questionnaire
+**When:** User wants to redo their personal setup, restart the welcome questionnaire, or reset their preferences from scratch.
+**Keywords:** "שאלון הכרות", "תתחיל מחדש", "הגדרות משתמש חדש", "שנה פרטים", "עשה לי שאלון", "בוא נתחיל מחדש", "onboarding"
+**Important:** Do NOT use this for updating a single setting (color, name, contact) — that is `edit_preferences`.
+
+**Few-shot:**
+**User:** "תוכל לעשות לי שאלון היכרות כמו למשתמש חדש?"
+```json
+{{"intent": "start_onboarding", "response_text": "בטח! בוא נתחיל מחדש עם השאלון 🎉", "payload": {{}}}}
+```
+
+**User:** "בוא נתחיל מחדש עם ההגדרות שלי"
+```json
+{{"intent": "start_onboarding", "response_text": "יאללה! מאפס את ההגדרות ומתחיל שאלון חדש 🔄", "payload": {{}}}}
+```
+
+### 10. `chat` - General Conversation
 **When:** Questions, greetings, or out-of-scope requests.
 **Keywords:** "מה אתה יודע", "מה שלומך", "תודה", requests unrelated to calendar
 
@@ -429,7 +460,7 @@ INTENT_FUNCTION_SCHEMA = {
         "properties": {
             "intent": {
                 "type": "string",
-                "enum": ["create_event", "set_reminder", "daily_check_setup", "edit_preferences", "get_events", "update_event", "delete_event", "admin_test", "chat"],
+                "enum": ["create_event", "set_reminder", "daily_check_setup", "edit_preferences", "show_preferences", "get_events", "update_event", "delete_event", "start_onboarding", "admin_test", "chat"],
                 "description": "The classified intent of the user's message"
             },
             "response_text": {

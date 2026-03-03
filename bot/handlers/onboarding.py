@@ -17,7 +17,6 @@ from bot.states import OnboardingStates
 from bot.keyboards import (
     get_gender_keyboard,
     get_yes_no_keyboard,
-    get_time_selection_keyboard,
     get_onboarding_confirm_keyboard
 )
 
@@ -229,121 +228,51 @@ async def onboarding_gender(callback: CallbackQuery, state: FSMContext) -> None:
     # Edit message to show selection
     gender_text = "זכר" if gender == "male" else "נקבה"
     await callback.message.edit_text(f"✅ בחרת: {gender_text}")
-    
-    # Move to reminders step
-    await state.set_state(OnboardingStates.WAITING_FOR_REMINDERS)
+
+    # Move to Reminder Mode step
+    await state.set_state(OnboardingStates.WAITING_FOR_REMINDER_MODE)
     await callback.message.answer(
-        "🔔 *תזכורות*\n\n"
-        "האם תרצה להפעיל שירות שבו תוכל לבקש ממני להזכיר לך דברים בשעה מסוימת?",
+        "🔔 *מצב תזכורות*\n\n"
+        "האם תרצה שאפעיל עבורך את *'מצב תזכורות'*?\n\n"
+        "כשתבקש ממני להזכיר לך משהו, אקבע זאת ביומן עם הקידומת "
+        "_'תזכורת:'_ ובצבע כתום — כדי שתוכל להבחין בין תזכורות לאירועים רגילים.",
         parse_mode="Markdown",
-        reply_markup=get_yes_no_keyboard("reminders")
+        reply_markup=get_yes_no_keyboard("reminder_mode")
     )
 
 
 # =============================================================================
-# Step 4: Reminders
+# Step 4: Reminder Mode
 # =============================================================================
 
-@router.callback_query(OnboardingStates.WAITING_FOR_REMINDERS, F.data.startswith("reminders_"))
-async def onboarding_reminders(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(OnboardingStates.WAITING_FOR_REMINDER_MODE, F.data.startswith("reminder_mode_"))
+async def onboarding_reminder_mode(callback: CallbackQuery, state: FSMContext) -> None:
     """
-    Step 4: Enable/disable reminders.
+    Step 4: Enable or disable Reminder Mode.
+    When ON, reminder requests get a 'תזכורת:' prefix and orange color in the calendar.
     """
-    enable = callback.data == "reminders_yes"
-    
-    # Save to FSM storage
-    await state.update_data(enable_reminders=enable)
-    
-    # Acknowledge callback
+    enable = callback.data == "reminder_mode_yes"
+
     await callback.answer()
-    
-    # Edit message to show selection
+    await state.update_data(reminder_mode=enable)
+
     status = "כן ✅" if enable else "לא ❌"
-    await callback.message.edit_text(f"תזכורות: {status}")
-    
-    # Move to daily check step
-    await state.set_state(OnboardingStates.WAITING_FOR_DAILY_CHECK)
-    await callback.message.answer(
-        "📋 *בדיקה יומית*\n\n"
-        "האם תרצה להפעיל שירות שבו תוכל להגיד לי 'תרשום לי משימה', "
-        "ואני אבדוק איתך מאוחר יותר אם ביצעת אותן?",
-        parse_mode="Markdown",
-        reply_markup=get_yes_no_keyboard("daily_check")
-    )
+    await callback.message.edit_text(f"מצב תזכורות: {status}")
 
-
-# =============================================================================
-# Step 5: Daily Check (with optional time selection)
-# =============================================================================
-
-@router.callback_query(OnboardingStates.WAITING_FOR_DAILY_CHECK, F.data.startswith("daily_check_"))
-async def onboarding_daily_check(callback: CallbackQuery, state: FSMContext) -> None:
-    """
-    Step 5: Enable/disable daily check.
-    If enabled, asks for preferred time.
-    """
-    enable = callback.data == "daily_check_yes"
-    
-    # Acknowledge callback
-    await callback.answer()
-    
-    if enable:
-        # Save to FSM storage (will be confirmed after time selection)
-        await state.update_data(enable_daily_check=True)
-        
-        # Edit message
-        await callback.message.edit_text("בדיקה יומית: כן ✅")
-        
-        # Ask for time
-        await state.set_state(OnboardingStates.WAITING_FOR_DAILY_TIME)
-        await callback.message.answer(
-            "⏰ *באיזו שעה נוח לך?*\n\n"
-            "בחר את השעה ביום שבה אשלח לך הודעה ואבדוק איתך האם ביצעת את המשימות.",
-            parse_mode="Markdown",
-            reply_markup=get_time_selection_keyboard()
-        )
-    else:
-        # Skip time selection
-        await state.update_data(enable_daily_check=False, daily_check_hour=None)
-        
-        # Edit message
-        await callback.message.edit_text("בדיקה יומית: לא ❌")
-        
-        # Move to daily briefing step
-        await state.set_state(OnboardingStates.WAITING_FOR_DAILY_BRIEFING)
-        await send_daily_briefing_prompt(callback.message)
-
-
-@router.callback_query(OnboardingStates.WAITING_FOR_DAILY_TIME, F.data.startswith("daily_time_"))
-async def onboarding_daily_time(callback: CallbackQuery, state: FSMContext) -> None:
-    """
-    Step 5b: Capture daily check time selection.
-    """
-    time_data = callback.data.replace("daily_time_", "")
-    
-    # Acknowledge callback
-    await callback.answer()
-    
-    if time_data == "cancel":
-        # User cancelled - disable daily check
-        await state.update_data(enable_daily_check=False, daily_check_hour=None)
-        await callback.message.edit_text("בדיקה יומית: בוטל ❌")
-    else:
-        # Save selected hour
-        hour = int(time_data)
-        await state.update_data(enable_daily_check=True, daily_check_hour=hour)
-        await callback.message.edit_text(f"⏰ בדיקה יומית: {hour:02d}:00 ✅")
-    
     # Move to daily briefing step
     await state.set_state(OnboardingStates.WAITING_FOR_DAILY_BRIEFING)
     await send_daily_briefing_prompt(callback.message)
 
 
+# =============================================================================
+# Step 5: Daily Briefing
+# =============================================================================
+
 async def send_daily_briefing_prompt(message) -> None:
     """Helper to send the daily briefing question."""
     await message.answer(
-        "☕ *עוד משהו קטן* -\n"
-        "בא לך שאשלח לך כל בוקר ב-8:00 הודעה מתומצת עם הל\"\u05d6 להיום? \u2600\ufe0f",
+        "☀️ *דיווח בוקרי*\n\n"
+        "בא לך שאשלח לך כל בוקר ב-8:00 הודעה מתומצת עם הלוז להיום? ☀️",
         parse_mode="Markdown",
         reply_markup=get_yes_no_keyboard("daily_briefing")
     )
@@ -352,7 +281,7 @@ async def send_daily_briefing_prompt(message) -> None:
 @router.callback_query(OnboardingStates.WAITING_FOR_DAILY_BRIEFING, F.data.startswith("daily_briefing_"))
 async def onboarding_daily_briefing(callback: CallbackQuery, state: FSMContext) -> None:
     """
-    Step 5c: Enable/disable daily morning briefing.
+    Step 5: Enable/disable daily morning briefing.
     If enabled, shows instant preview of today's schedule.
     """
     enable = callback.data == "daily_briefing_yes"
@@ -519,12 +448,10 @@ async def onboarding_contacts(message: Message, state: FSMContext) -> None:
         "personal_info.nickname": nickname,
         "personal_info.agent_nickname": agent_nickname,
         "personal_info.gender": gender,
-        "enable_reminders": enable_reminders,
-        "enable_daily_check": enable_daily_check,
-        "calendar_config.daily_check_hour": daily_check_hour,
+        "preferences.reminder_mode": data.get("reminder_mode", False),
+        "preferences.daily_briefing": data.get("daily_briefing", False),
         "calendar_config.color_map": color_map,
         "contacts": contacts_data,
-        "preferences.daily_briefing": data.get("daily_briefing", False),
         "onboarding_completed": True
     })
     
