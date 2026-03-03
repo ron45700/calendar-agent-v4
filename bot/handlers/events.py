@@ -144,20 +144,21 @@ async def process_multi_event_creation(
     - Events that require FSM pauses (missing contacts, no recurrence end date)
       are skipped with a note — the user can create them individually.
     - Auth errors on any event abort the remaining batch.
+    - Color resolution mirrors create_event_from_payload exactly.
     """
     user_id = message.from_user.id
     user_contacts = user.get("contacts", {})
     tokens = get_user_tokens(user)
+    color_map = user.get("calendar_config", {}).get("color_map", {})
 
     if not tokens:
         await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
         return
 
     total = len(events_batch)
-    successes: List[str] = []   # Event titles that succeeded
-    failures: List[str] = []    # Event titles that failed
+    successes: List[str] = []
+    failures: List[str] = []
 
-    # Status message so the user knows work is in progress
     status_msg = await message.answer(
         f"⚡ *יוצר {total} אירועים...* רגע אחד!",
         parse_mode="Markdown"
@@ -172,24 +173,55 @@ async def process_multi_event_creation(
             missing = find_missing_contacts(attendee_names, user_contacts)
             if missing:
                 failures.append(
-                    f"❌ *{summary}* — חסר מייל של {missing[0]} "
-                    f"(צור ידנית עם /)\n_צור את האירוע ידנית כדי לספק את המייל_"
+                    f"❌ *{summary}* — חסר מייל של {missing[0]} (צור ידנית)"
                 )
                 continue
 
         if ev_payload.get("recurrence_freq") and not ev_payload.get("recurrence_end_date"):
-            failures.append(
-                f"⚠️ *{summary}* — אירוע חוזר ללא תאריך סיום "
-                f"(צור ידנית)"
-            )
+            failures.append(f"⚠️ *{summary}* — אירוע חוזר ללא תאריך סיום (צור ידנית)")
             continue
 
-        # Create the event
+        # --- Resolve attendee emails (mirrors create_event_from_payload) ---
+        if attendee_names:
+            resolved = resolve_attendee_emails(attendee_names, user_contacts)
+            ev_payload["resolved_attendees"] = resolved
+
+        # --- Color resolution (mirrors create_event_from_payload exactly) ---
+        category = ev_payload.get("category", "general")
+        color_name = ev_payload.get("color_name")
+        color_id = None
+
+        if color_name:
+            canonical = HEBREW_COLOR_MAP.get(color_name, color_name)
+            color_id = CALENDAR_COLORS.get(canonical)
+
+        if not color_id and ev_payload.get("color_id"):
+            color_id = ev_payload.get("color_id")
+
+        if not color_id and color_map and category in color_map:
+            color_id = color_map[category]
+
+        if not color_id:
+            from services.calendar_service import DEFAULT_COLOR_ID
+            color_id = DEFAULT_COLOR_ID
+
+        # --- All-day guard ---
+        if ev_payload.get("is_all_day") and not ev_payload.get("end_time"):
+            try:
+                start_date = datetime.fromisoformat(ev_payload["start_time"])
+                ev_payload["end_time"] = (start_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # --- Create the event via add_event (same as single-event flow) ---
         try:
             create_result = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(
-                    None, lambda ev=ev_payload: calendar_service.create_event(
-                        tokens, ev, user_id=str(user_id)
+                    None, lambda ev=ev_payload, cid=color_id: calendar_service.add_event(
+                        user_tokens=tokens,
+                        event_data=ev,
+                        color_id=int(cid) if cid else None,
+                        user_id=str(user_id)
                     )
                 ),
                 timeout=12
@@ -215,29 +247,30 @@ async def process_multi_event_creation(
                     pass
             successes.append(f"✅ *{summary}*{day_str}")
         elif create_result.get("type") == ERROR_AUTH_REQUIRED:
-            # Auth failure — abort remaining events
             failures.append(f"🔐 *{summary}* — ההרשאה פגה, בוטלו שאר האירועים")
             break
         else:
             failures.append(f"❌ *{summary}* — {create_result.get('message', 'שגיאה')}")
 
-    # Delete the in-progress status message
+    # Delete status message
     try:
         await status_msg.delete()
     except Exception:
         pass
 
-    # Build summary
+    # Build and send summary
     lines = [f"📋 *תוצאות יצירת {total} האירועים:*\n"]
     lines.extend(successes)
     if failures:
         if successes:
-            lines.append("")  # blank separator
+            lines.append("")
         lines.extend(failures)
 
     summary_msg = "\n".join(lines)
     firestore_service.save_message(user_id, "assistant", summary_msg)
     await message.answer(summary_msg, parse_mode="Markdown")
+
+
 
 
 # =============================================================================
