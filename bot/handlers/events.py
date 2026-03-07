@@ -18,7 +18,7 @@ from services.calendar_service import (
     CALENDAR_COLORS, COLOR_ID_EMOJI, DEFAULT_EVENT_EMOJI
 )
 from services.firestore_service import firestore_service
-from bot.states import EventFlowStates, DeleteFlowStates, RecurrenceFlowStates
+from bot.states import EventFlowStates, DeleteFlowStates, UpdateFlowStates, RecurrenceFlowStates
 from bot.utils import get_formatted_current_time
 from config import WEBAPP_URL
 
@@ -275,8 +275,51 @@ async def _process_event_core(
 
 
 # =============================================================================
-# Multi-Event Creation (Batch Mode)
+# Ordinal Selection Parser (used by Phase 2 FSM handlers — no LLM needed)
 # =============================================================================
+
+_ORDINAL_MAP: Dict[str, int] = {
+    # Numbers
+    "1": 0, "2": 1, "3": 2, "4": 3, "5": 4,
+    # Hebrew ordinals
+    "ראשון": 0, "הראשון": 0, "ראשונה": 0, "הראשונה": 0,
+    "שני": 1, "השני": 1, "שנייה": 1, "השנייה": 1,
+    "שלישי": 2, "השלישי": 2, "שלישית": 2, "השלישית": 2,
+    "רביעי": 3, "הרביעי": 3, "רביעית": 3, "הרביעית": 3,
+    "חמישי": 4, "החמישי": 4, "חמישית": 4, "החמישית": 4,
+    # English ordinals
+    "first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
+    "1st": 0, "2nd": 1, "3rd": 2, "4th": 3, "5th": 4,
+}
+_ALL_PHRASES = {"כולם", "הכל", "את כולם", "כל", "כולנ", "all", "all of them", "every"}
+
+
+def _parse_ordinal(text: str, max_index: int) -> Optional[Any]:
+    """
+    Parse a selection from the user's text.
+
+    Returns:
+        - int index (0-based) for a single selection
+        - "all" for select-all phrases
+        - None if not understood
+    """
+    clean = text.strip().lower()
+    if clean in _ALL_PHRASES:
+        return "all"
+    # Direct ordinal lookup
+    for token in clean.split():
+        if token in _ORDINAL_MAP:
+            idx = _ORDINAL_MAP[token]
+            if idx < max_index:
+                return idx
+    # Also try the whole phrase
+    if clean in _ORDINAL_MAP:
+        idx = _ORDINAL_MAP[clean]
+        if idx < max_index:
+            return idx
+    return None
+
+
 
 async def process_multi_event_creation(
     message: Message,
@@ -841,14 +884,22 @@ async def process_update_event(
         return
     
     if len(events) > 1:
-        # Multiple matches — ask user to clarify
-        lines = ["מצאתי כמה אירועים שמתאימים:\n"]
-        for i, ev in enumerate(events[:5], 1):  # Cap at 5
-            summary = ev.get("summary", "ללא שם")
+        # Multiple matches — enter FSM so next reply bypasses LLM
+        candidates = events[:5]
+        lines = [f"מצאתי כמה אירועים שמתאימים ל-'{hint}':\n"]
+        for i, ev in enumerate(candidates, 1):
+            ev_summary = ev.get("summary", "ללא שם")
             time_str = _format_event_time(ev)
-            lines.append(f"{i}️⃣ {summary} - {time_str}")
-        lines.append("\nאיזה מהם לעדכן?")
+            lines.append(f"{i}\ufe0f\u20e3 {ev_summary} - {time_str}")
+        lines.append("\nאיזה מהם לעדכן? (כתוב מספר, שם לדוגמא 'ראשון', או 'כולם')")
         multi_msg = "\n".join(lines)
+        # Save candidates + pending update payload to FSM
+        await state.update_data(
+            update_candidates=candidates,
+            update_payload=payload,
+            update_tokens=tokens,
+        )
+        await state.set_state(UpdateFlowStates.WAITING_FOR_SELECTION)
         firestore_service.save_message(user_id, "assistant", multi_msg)
         await message.answer(multi_msg)
         return
@@ -1046,14 +1097,20 @@ async def process_delete_event(
         return
     
     if len(events) > 1:
-        # Multiple matches — ask user to clarify
-        lines = [f"מצאתי כמה אירועים שמתאימים ל'{hint}':\n"]
-        for i, ev in enumerate(events[:5], 1):
-            summary = ev.get("summary", "ללא שם")
+        # Multiple matches — enter FSM so next reply bypasses LLM
+        candidates = events[:5]
+        lines = [f"מצאתי כמה אירועים שמתאימים ל-'{hint}':\n"]
+        for i, ev in enumerate(candidates, 1):
+            ev_summary = ev.get("summary", "ללא שם")
             time_str = _format_event_time(ev)
-            lines.append(f"{i}️⃣ {summary} - {time_str}")
-        lines.append("\nאיזה מהם למחוק?")
+            lines.append(f"{i}\ufe0f\u20e3 {ev_summary} - {time_str}")
+        lines.append("\nאיזה מהם למחוק? (כתוב מספר, שם לדוגמא 'ראשון', או 'כולם')")
         multi_msg = "\n".join(lines)
+        await state.update_data(
+            delete_candidates=candidates,
+            delete_tokens=tokens,
+        )
+        await state.set_state(DeleteFlowStates.WAITING_FOR_MULTI_SELECTION)
         firestore_service.save_message(user_id, "assistant", multi_msg)
         await message.answer(multi_msg)
         return
@@ -1097,8 +1154,266 @@ DELETE_CANCEL_PHRASES = {"לא", "ביטול", "תעזוב", "עזוב", "no", "
 
 
 # =============================================================================
-# Recurrence End Date Handler
+# Phase 2: Update Selection Handler
 # =============================================================================
+
+@router.message(UpdateFlowStates.WAITING_FOR_SELECTION)
+async def handle_update_selection(
+    message: Message,
+    state: FSMContext,
+    user: Optional[UserData]
+) -> None:
+    """
+    Handle the user's selection reply after the bot listed multiple matching events.
+    Resolves the ordinal locally — no LLM call.
+    Supports single picks ('ראשון', '2') and select-all ('כולם').
+    """
+    user_id = message.from_user.id
+    text = message.text.strip() if message.text else ""
+    firestore_service.save_message(user_id, "user", text)
+
+    data = await state.get_data()
+    candidates: List[Dict] = data.get("update_candidates", [])
+    payload: Dict = data.get("update_payload", {})
+    tokens: Dict = data.get("update_tokens", {})
+
+    # Cancel check
+    CANCEL_WORDS = {"בטל", "עצור", "לא משנה", "cancel", "stop", "עזוב", "ביטול"}
+    if text.strip().lower() in CANCEL_WORDS:
+        await state.clear()
+        ack = "✅ בוטל."
+        firestore_service.save_message(user_id, "assistant", ack)
+        await message.answer(ack)
+        return
+
+    selection = _parse_ordinal(text, len(candidates))
+    if selection is None:
+        retry_msg = (
+            f"לא הבנתי את הבחירה. 🤔\n"
+            f"כתוב מספר בין 1 ל-{len(candidates)}, שם כמו 'ראשון', או 'כולם'."
+        )
+        firestore_service.save_message(user_id, "assistant", retry_msg)
+        await message.answer(retry_msg)
+        return
+
+    # Resolve to list of target events
+    targets = candidates if selection == "all" else [candidates[selection]]
+
+    await state.clear()
+
+    if len(targets) == 1:
+        # Single update — run through existing single-event update engine
+        target_event = targets[0]
+        event_id = target_event.get("id")
+        old_summary_str = target_event.get("summary", "ללא שם")
+        old_time_str = _format_event_time(target_event)
+        old_color_id = target_event.get("colorId", "")
+        old_location = target_event.get("location", "")
+
+        updates: Dict = {}
+        diff_lines: List[str] = []
+
+        if payload.get("new_summary"):
+            updates["summary"] = payload["new_summary"]
+            diff_lines.append(f"📝 שם:\n  ⬅️ {old_summary_str}\n  ➡️ {payload['new_summary']}")
+
+        if payload.get("new_start_time"):
+            updates["start_time"] = payload["new_start_time"]
+            if payload.get("new_end_time"):
+                updates["end_time"] = payload["new_end_time"]
+            try:
+                new_dt = datetime.fromisoformat(payload["new_start_time"])
+                dn = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+                new_time_str = f"יום {dn[new_dt.weekday()]} {new_dt.strftime('%d/%m')} ב-{new_dt.strftime('%H:%M')}"
+            except Exception:
+                new_time_str = payload["new_start_time"]
+            diff_lines.append(f"⏰ מועד:\n  ⬅️ {old_time_str}\n  ➡️ {new_time_str}")
+
+        if payload.get("new_color_name"):
+            new_color_id = CALENDAR_COLORS.get(payload["new_color_name"])
+            if new_color_id:
+                updates["color_id"] = new_color_id
+                old_emoji = COLOR_ID_EMOJI.get(str(old_color_id), DEFAULT_EVENT_EMOJI)
+                new_emoji = COLOR_ID_EMOJI.get(str(new_color_id), DEFAULT_EVENT_EMOJI)
+                old_heb = COLOR_ID_HEBREW.get(int(old_color_id) if old_color_id else 0, "ברירת מחדל")
+                new_heb = payload.get("new_color_name_hebrew", COLOR_ID_HEBREW.get(new_color_id, "?"))
+                diff_lines.append(f"🎨 צבע:\n  ⬅️ {old_emoji} {old_heb}\n  ➡️ {new_emoji} {new_heb}")
+
+        if payload.get("new_location"):
+            updates["location"] = payload["new_location"]
+            diff_lines.append(f"📍 מיקום:\n  ⬅️ {old_location or 'ללא'}\n  ➡️ {payload['new_location']}")
+
+        if not updates:
+            await message.answer("🤔 לא הבנתי מה לשנות.")
+            return
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: calendar_service.update_event(
+                        tokens, event_id=event_id, updates=updates, user_id=str(user_id)
+                    )
+                ), timeout=10
+            )
+        except asyncio.TimeoutError:
+            await message.answer("⏳ Google Calendar לא הגיב. נסה שוב.")
+            return
+
+        if result.get("status") != "success":
+            await message.answer("❌ שגיאה בעדכון. נסה שוב.")
+            return
+
+        before_card = _format_event_card(target_event)
+        diff_display = "\n\n".join(diff_lines)
+        success_msg = (
+            f"✅ *האירוע עודכן בהצלחה!*\n\n"
+            f"⬅️ *לפני:*\n{before_card}\n\n"
+            f"➡️ *השינויים:*\n{diff_display}\n\nעוד שינוי? 😎"
+        )
+        firestore_service.save_message(user_id, "assistant", success_msg)
+        await message.answer(success_msg, parse_mode="Markdown")
+
+    else:
+        # Multi-update: loop all selected events, send a consolidated summary
+        successes: List[str] = []
+        failures: List[str] = []
+        for target_event in targets:
+            event_id = target_event.get("id")
+            ev_summary = target_event.get("summary", "ללא שם")
+            old_color_id = target_event.get("colorId", "")
+            updates: Dict = {}
+
+            if payload.get("new_summary"):
+                updates["summary"] = payload["new_summary"]
+            if payload.get("new_start_time"):
+                updates["start_time"] = payload["new_start_time"]
+                if payload.get("new_end_time"):
+                    updates["end_time"] = payload["new_end_time"]
+            if payload.get("new_color_name"):
+                new_color_id = CALENDAR_COLORS.get(payload["new_color_name"])
+                if new_color_id:
+                    updates["color_id"] = new_color_id
+            if payload.get("new_location"):
+                updates["location"] = payload["new_location"]
+
+            if not updates:
+                failures.append(f"⚠️ *{ev_summary}* — אין שינויים להחיל")
+                continue
+
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda eid=event_id, u=updates: calendar_service.update_event(
+                            tokens, event_id=eid, updates=u, user_id=str(user_id)
+                        )
+                    ), timeout=10
+                )
+                if result.get("status") == "success":
+                    successes.append(f"✅ *{ev_summary}*")
+                else:
+                    failures.append(f"❌ *{ev_summary}* — {result.get('message', 'שגיאה')}")
+            except asyncio.TimeoutError:
+                failures.append(f"⏳ *{ev_summary}* — timeout")
+            except Exception as e:
+                logger.error(f"[UpdateSelection] Error on '{ev_summary}': {e}")
+                failures.append(f"❌ *{ev_summary}* — שגיאה")
+
+        lines_out = [f"📋 *עדכנתי {len(targets)} אירועים:*\n"]
+        lines_out.extend(successes)
+        if failures:
+            if successes:
+                lines_out.append("")
+            lines_out.extend(failures)
+        summary_msg = "\n".join(lines_out)
+        firestore_service.save_message(user_id, "assistant", summary_msg)
+        await message.answer(summary_msg, parse_mode="Markdown")
+
+
+# =============================================================================
+# Phase 2: Delete Multi-Selection Handler
+# =============================================================================
+
+@router.message(DeleteFlowStates.WAITING_FOR_MULTI_SELECTION)
+async def handle_delete_selection(
+    message: Message,
+    state: FSMContext,
+    user: Optional[UserData]
+) -> None:
+    """
+    Handle the user's selection reply after the bot listed multiple matching events for deletion.
+    Resolves ordinals locally — no LLM call.
+    For a single pick: transitions to WAITING_FOR_DELETE_CONFIRM (shows confirmation card).
+    For 'כולם': loops and deletes all, sends consolidated result.
+    """
+    user_id = message.from_user.id
+    text = message.text.strip() if message.text else ""
+    firestore_service.save_message(user_id, "user", text)
+
+    data = await state.get_data()
+    candidates: List[Dict] = data.get("delete_candidates", [])
+    tokens: Dict = data.get("delete_tokens", {})
+
+    # Cancel check
+    CANCEL_WORDS = {"בטל", "עצור", "לא משנה", "cancel", "stop", "עזוב", "ביטול"}
+    if text.strip().lower() in CANCEL_WORDS:
+        await state.clear()
+        ack = "✅ בוטל."
+        firestore_service.save_message(user_id, "assistant", ack)
+        await message.answer(ack)
+        return
+
+    selection = _parse_ordinal(text, len(candidates))
+    if selection is None:
+        retry_msg = (
+            f"לא הבנתי את הבחירה. 🤔\n"
+            f"כתוב מספר בין 1 ל-{len(candidates)}, שם כמו 'ראשון', או 'כולם'."
+        )
+        firestore_service.save_message(user_id, "assistant", retry_msg)
+        await message.answer(retry_msg)
+        return
+
+    if selection != "all":
+        # Single pick — transition to standard delete confirmation flow
+        target_event = candidates[selection]
+        event_id = target_event.get("id")
+        ev_summary = target_event.get("summary", "ללא שם")
+        time_str = _format_event_time(target_event)
+
+        event_card = _format_event_card(target_event)
+        confirm_msg = (
+            f"🗑️ *מצאתי את האירוע הזה:*\n\n"
+            f"{event_card}\n\n"
+            f"⚠️ *בטוח שאתה רוצה למחוק את האירוע הזה?*\n"
+            f"(כתוב *כן* למחיקה או *לא* לביטול)"
+        )
+        await state.update_data(
+            delete_event_id=event_id,
+            delete_event_summary=ev_summary,
+            delete_event_time=time_str,
+            delete_tokens=tokens,
+        )
+        await state.set_state(DeleteFlowStates.WAITING_FOR_DELETE_CONFIRM)
+        firestore_service.save_message(user_id, "assistant", confirm_msg)
+        await message.answer(confirm_msg, parse_mode="Markdown")
+        return
+
+    # "כולם" — delete all candidates with a single consolidated confirm prompt
+    await state.clear()
+    summaries = [ev.get("summary", "ללא שם") for ev in candidates]
+    bulk_confirm = (
+        f"⚠️ *בטוח שאתה רוצה למחוק את כל {len(candidates)} האירועים הבאים?*\n"
+        + "\n".join(f"• {s}" for s in summaries)
+        + "\n\n(כתוב *כן* למחיקה או *לא* לביטול)"
+    )
+    # Save the full batch for the confirm handler
+    await state.update_data(
+        delete_all_candidates=candidates,
+        delete_tokens=tokens,
+    )
+    await state.set_state(DeleteFlowStates.WAITING_FOR_DELETE_CONFIRM)
+    firestore_service.save_message(user_id, "assistant", bulk_confirm)
+    await message.answer(bulk_confirm, parse_mode="Markdown")
+
 
 @router.message(RecurrenceFlowStates.WAITING_FOR_END_CONDITION)
 async def handle_recurrence_end_date(
