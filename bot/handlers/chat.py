@@ -332,15 +332,42 @@ async def process_user_intent(
 ) -> None:
     """Process user message through LLM intent classification and route accordingly."""
     logger.info(f"[Intent] Starting intent classification for user {user_id}")
-    
+
+    # =========================================================================
+    # Layer 0: Global Cancellation Intercept (runs BEFORE the LLM)
+    # If the user says a cancel phrase and any FSM flow is active,
+    # abort immediately — never let the LLM see "בטל" in that context.
+    # =========================================================================
+    GLOBAL_CANCEL_PHRASES = {
+        # Hebrew
+        "בטל", "עצור", "לא משנה", "תעזוב", "עזוב", "תפסיק", "פסיק", "לא רוצה",
+        "תשכח", "שכח מזה", "אין צורך", "לא צריך", "ביטול",
+        # English
+        "cancel", "stop", "abort", "never mind", "forget it", "quit", "exit",
+    }
+    current_state = await state.get_state()
+    if text.strip().lower() in GLOBAL_CANCEL_PHRASES and current_state is not None:
+        logger.info(f"[Cancel] Global cancel intercepted in state '{current_state}' — clearing FSM")
+        await state.clear()
+        if thinking_msg:
+            try:
+                await thinking_msg.delete()
+            except Exception:
+                pass
+        cancel_ack = "✅ בוטל. במה אפשר לעזור?"
+        firestore_service.save_message(user_id, "assistant", cancel_ack)
+        await message.answer(cancel_ack)
+        return
+    # =========================================================================
+
     current_time = get_formatted_current_time()
     logger.info(f"[Intent] Current time: {current_time}")
-    
+
     # Get user info
     personal_info = user.get("personal_info", {})
     agent_name = personal_info.get("agent_nickname") or "הבוט"
     user_nickname = personal_info.get("nickname") or "חבר"
-    
+
     # Get preferences
     user_preferences = {
         "enable_reminders": user.get("enable_reminders", False),
@@ -348,13 +375,13 @@ async def process_user_intent(
         "color_map": user.get("calendar_config", {}).get("color_map", {}),
         "daily_check_hour": user.get("calendar_config", {}).get("daily_check_hour")
     }
-    
+
     contacts = user.get("contacts", {})
-    
+
     logger.info(f"[Firestore] Getting recent messages for context")
     history = firestore_service.get_recent_messages(user_id, limit=8)
     logger.info(f"[Firestore] Got {len(history)} messages from history")
-    
+
     # Classify intent with OpenAI
     logger.info(f"🤖 [OpenAI] Sending request to classify intent...")
     try:

@@ -224,7 +224,16 @@ When the user asks to create **more than one event in a single message**, use `e
 **When:** Questions, greetings, or out-of-scope requests.
 **Keywords:** "מה אתה יודע", "מה שלומך", "תודה", requests unrelated to calendar
 
----
+> ⚠️ **CRITICAL — Cancellation Words:**
+> If the user sends a bare cancellation word ("בטל", "עצור", "לא משנה", "cancel", "stop", "never mind") **without a specific event name or date**, classify it as `chat`.
+> Do NOT classify it as `delete_event`. The bot's FSM layer handles in-flow cancellations directly — the LLM must never intercept them.
+
+**Few-shot (cancellation):**
+**User:** "בטל"
+```json
+{{"intent": "chat", "response_text": "אוקי, אין בעיה! איך אפשר לעזור?", "payload": {{}}}}
+```
+
 
 ## SAFETY NET LOGIC
 

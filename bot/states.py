@@ -73,6 +73,18 @@ class DeleteFlowStates(StatesGroup):
     """
     # User must confirm or cancel the pending deletion
     WAITING_FOR_DELETE_CONFIRM = State()
+    # Multiple matches found — user must pick which one to delete
+    WAITING_FOR_MULTI_SELECTION = State()
+
+
+class UpdateFlowStates(StatesGroup):
+    """
+    States for the event update disambiguation flow.
+    When multiple events match the search hint, the bot lists them
+    and waits here for the user to pick one (or all) using an ordinal.
+    The selection is resolved locally — no LLM is called.
+    """
+    WAITING_FOR_SELECTION = State()
 
 
 class RecurrenceFlowStates(StatesGroup):
