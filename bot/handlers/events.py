@@ -320,6 +320,139 @@ def _parse_ordinal(text: str, max_index: int) -> Optional[Any]:
     return None
 
 
+# =============================================================================
+# Phase 4: Broad Fetch & Local Filter Helper
+# =============================================================================
+# 
+# PILLAR 4 ARCHITECTURE: "Broad Fetch & Local Filter"
+# =====================================================
+# 
+# PROBLEM:
+# Google Calendar's `q` text-search parameter is unreliable for Hebrew and 
+# partial matches. Example: q="אימון ביום ראשון" returns 0 results even when
+# the event exists.
+#
+# SOLUTION:
+# 1. Extract time window from LLM payload (time_hint_from / time_hint_to)
+# 2. Fetch ALL events in that narrow window (no `q` param)
+# 3. Filter locally using Python substring match (case-insensitive)
+#
+# BENEFITS:
+# - Hebrew substring matching works perfectly (Python str.lower())
+# - User says "אימון" → finds "אימון כדורסל" ✅
+# - Narrow time window keeps performance acceptable
+# - No dependency on Google's flaky text search
+#
+# TIME WINDOW STRATEGY:
+# - If time_from specified: start at 00:00:00 of that day
+# - If time_to specified: end at 23:59:59 of that day (FULL DAY COVERAGE)
+# - If no time: default to today 00:00 → +7 days 23:59:59
+# - This ensures we capture ALL events on the mentioned day
+#
+# =============================================================================
+
+async def _fetch_and_filter_events(
+    tokens: Dict,
+    hint: str,
+    time_from: Optional[str],
+    time_to: Optional[str],
+    user_id: int,
+) -> tuple:
+    """
+    Phase 4 core search engine: fetch ALL events in a narrow time window,
+    then filter locally by keyword substring match.
+
+    This replaces Google's `q` text-search param which is unreliable for Hebrew
+    partial matches (e.g. q="אימון ביום ראשון" returns 0 results).
+
+    Args:
+        tokens:    OAuth tokens
+        hint:      Short keyword from original_event_hint (event name only)
+        time_from: ISO YYYY-MM-DD start (from time_hint_from; may be None)
+        time_to:   ISO YYYY-MM-DD end   (from time_hint_to;   may be None)
+        user_id:   Telegram user ID for auth cleanup
+
+    Returns:
+        (status, events) where status is "success", "auth", or "error"
+    """
+    from zoneinfo import ZoneInfo
+    ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+
+    try:
+        # Build narrow time window with FULL DAY COVERAGE
+        # ================================================
+        # CRITICAL: When user says "Monday", we must search the ENTIRE day
+        # from 00:00:00 to 23:59:59, not just a single timestamp.
+        
+        if time_from:
+            from datetime import date as date_cls
+            d_from = date_cls.fromisoformat(time_from)
+            # START: Beginning of the day (00:00:00)
+            time_min = datetime(d_from.year, d_from.month, d_from.day,
+                                0, 0, 0, tzinfo=ISRAEL_TZ).isoformat()
+        else:
+            # Default: start of today
+            now = datetime.now(ISRAEL_TZ)
+            time_min = datetime(now.year, now.month, now.day,
+                                0, 0, 0, tzinfo=ISRAEL_TZ).isoformat()
+
+        if time_to:
+            from datetime import date as date_cls
+            d_to = date_cls.fromisoformat(time_to)
+            # END: End of the day (23:59:59) - captures ALL events on that day
+            time_max = datetime(d_to.year, d_to.month, d_to.day,
+                                23, 59, 59, tzinfo=ISRAEL_TZ).isoformat()
+        else:
+            # Default: 7 days ahead (narrow enough to be useful)
+            now = datetime.now(ISRAEL_TZ)
+            future = now + timedelta(days=7)
+            time_max = datetime(future.year, future.month, future.day,
+                                23, 59, 59, tzinfo=ISRAEL_TZ).isoformat()
+
+        logger.info(f"[FetchFilter] Fetching window {time_min} → {time_max} | hint='{hint}'")
+
+        # Broad fetch: ALL events in the window, no q param
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: calendar_service.get_upcoming_events(
+                    tokens, max_results=50,
+                    time_min=time_min, time_max=time_max,
+                    user_id=str(user_id)
+                )
+            ), timeout=10
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[FetchFilter] Timeout")
+        return ("timeout", [])
+    except Exception as e:
+        logger.error(f"[FetchFilter] Exception: {e}")
+        return ("error", [])
+
+    if result.get("status") != "success":
+        if result.get("type") == ERROR_AUTH_REQUIRED:
+            return ("auth", [])
+        return ("error", [])
+
+    all_events = result.get("events", [])
+    logger.info(f"[FetchFilter] Fetched {len(all_events)} events in window")
+
+    # Local filter: substring match (case-insensitive)
+    hint_lower = hint.strip().lower()
+    if hint_lower:
+        filtered = [
+            ev for ev in all_events
+            if hint_lower in ev.get("summary", "").lower()
+        ]
+    else:
+        filtered = all_events  # No hint — return all in window
+
+    logger.info(f"[FetchFilter] {len(filtered)} events after local filter")
+    return ("success", filtered)
+
+
+# =============================================================================
+# Multi-Event Creation Handler
+# =============================================================================
 
 async def process_multi_event_creation(
     message: Message,
@@ -1096,39 +1229,27 @@ async def process_update_event(
         await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
         return
     
-    # Extract search hint
+    # Extract search hint and time window
     hint = payload.get("original_event_hint", "")
     if not hint:
         await message.answer("🤔 לא הבנתי איזה אירוע לעדכן. נסה שוב עם שם האירוע.")
         return
-    
-    # Search for the event
-    logger.info(f"[Update] Searching for event: '{hint}'")
-    try:
-        result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                None, lambda: calendar_service.search_events(
-                    tokens, query=hint, user_id=str(user_id)
-                )
-            ), timeout=10
-        )
-    except asyncio.TimeoutError:
-        await message.answer("⏳ Google Calendar לא הגיב בזמן. נסה שוב.")
+
+    time_from = payload.get("time_hint_from")
+    time_to = payload.get("time_hint_to") or time_from  # Default end = same day as start
+
+    # Phase 4: Broad fetch + local filter
+    logger.info(f"[Update] FetchFilter hint='{hint}' from={time_from} to={time_to}")
+    status, events = await _fetch_and_filter_events(tokens, hint, time_from, time_to, user_id)
+
+    if status == "auth":
+        await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
         return
-    except Exception as e:
-        logger.error(f"[Update] Search error: {e}")
+    if status in ("error", "timeout"):
         await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
         return
-    
-    if result.get("status") != "success":
-        if result.get("type") == ERROR_AUTH_REQUIRED:
-            await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
-        else:
-            await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
-        return
-    
-    events = result.get("events", [])
-    
+
+
     # --- Handle match count ---
     if len(events) == 0:
         no_match_msg = (
@@ -1309,39 +1430,27 @@ async def process_delete_event(
         await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
         return
     
-    # Extract search hint
+    # Extract search hint and time window
     hint = payload.get("original_event_hint", "")
     if not hint:
         await message.answer("🤔 לא הבנתי איזה אירוע למחוק. נסה שוב עם שם האירוע.")
         return
-    
-    # Search for the event
-    logger.info(f"[Delete] Searching for event: '{hint}'")
-    try:
-        result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                None, lambda: calendar_service.search_events(
-                    tokens, query=hint, user_id=str(user_id)
-                )
-            ), timeout=10
-        )
-    except asyncio.TimeoutError:
-        await message.answer("⏳ Google Calendar לא הגיב בזמן. נסה שוב.")
+
+    time_from = payload.get("time_hint_from")
+    time_to = payload.get("time_hint_to") or time_from
+
+    # Phase 4: Broad fetch + local filter
+    logger.info(f"[Delete] FetchFilter hint='{hint}' from={time_from} to={time_to}")
+    status, events = await _fetch_and_filter_events(tokens, hint, time_from, time_to, user_id)
+
+    if status == "auth":
+        await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
         return
-    except Exception as e:
-        logger.error(f"[Delete] Search error: {e}")
+    if status in ("error", "timeout"):
         await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
         return
-    
-    if result.get("status") != "success":
-        if result.get("type") == ERROR_AUTH_REQUIRED:
-            await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
-        else:
-            await message.answer("❌ שגיאה בחיפוש האירוע. נסה שוב.")
-        return
-    
-    events = result.get("events", [])
-    
+
+
     # --- Handle match count ---
     if len(events) == 0:
         no_match_msg = (

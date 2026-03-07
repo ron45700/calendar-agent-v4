@@ -181,7 +181,9 @@ When the user asks to create **more than one event in a single message**, use `e
 **Keywords:** "תזיז את", "שנה את", "עדכן", "תעביר ל", "reschedule"
 **Critical:** You MUST extract `original_event_hint` — the keyword for FINDING the event in the calendar.
 **Payload fields:**
-  - `original_event_hint` (REQUIRED): Search keyword to locate the event (e.g. "אימון", "פגישה עם דני")
+  - `original_event_hint` (REQUIRED): Short keyword to locate the event — just the event name, e.g. "אימון", "פגישה עם דני". **Do NOT include day/date in this field.**
+  - `time_hint_from` (ISO YYYY-MM-DD, REQUIRED if user mentions a day/date): Start of the date window to search in. Example: "ביום ראשון" → date of next Sunday.
+  - `time_hint_to` (ISO YYYY-MM-DD): End of the date window (same as `time_hint_from` for a single day).
   - `new_summary`: New title (only if user asked to rename)
   - `new_start_time`: New ISO 8601 start time (only if rescheduling)
   - `new_end_time`: New ISO 8601 end time (only if rescheduling)
@@ -191,13 +193,28 @@ When the user asks to create **more than one event in a single message**, use `e
   - `new_category`: New category (only if user asked to change)
   - `new_attendees`: List of attendee names to add (only if user asked to change attendees)
 
+**Few-shot:**
+**User:** "שנה את האימון ביום ראשון לצבע אדום"
+```json
+{{"intent": "update_event", "response_text": "בטח, משנה את האימון לצבע אדום 🔴", "payload": {{"original_event_hint": "אימון", "time_hint_from": "2026-03-08", "time_hint_to": "2026-03-08", "new_color_name": "tomato", "new_color_name_hebrew": "אדום"}}}}
+```
+
 ### 7. `delete_event` - Delete / Cancel Existing Event
 **When:** User wants to cancel, remove, or delete an event from the calendar.
 **Keywords:** "תמחק", "תבטל", "מחק", "בטל את", "cancel"
 **Critical:** You MUST extract `original_event_hint` — the keyword for FINDING the event.
 **Payload fields:**
-  - `original_event_hint` (REQUIRED): Search keyword to locate the event
-  - `time_hint`: Time range hint to narrow the search (e.g. "מחר", "ביום שלישי")
+  - `original_event_hint` (REQUIRED): Short keyword — just the event name. **Do NOT include day/date here.**
+  - `time_hint_from` (ISO YYYY-MM-DD, REQUIRED if user mentions a day/date): Start of the date window to search in.
+  - `time_hint_to` (ISO YYYY-MM-DD): End of the date window (same as `time_hint_from` for a single day).
+  - `time_hint`: (legacy) Time range hint to narrow the search (e.g. "מחר", "ביום שלישי")
+
+**Few-shot:**
+**User:** "תמחק את הפגישה מחר"
+```json
+{{"intent": "delete_event", "response_text": "בטח, מוחק את הפגישה מחר 🗑️", "payload": {{"original_event_hint": "פגישה", "time_hint_from": "2026-03-08", "time_hint_to": "2026-03-08"}}}}
+```
+
 
 ### MULTI-EVENT UPDATE
 
