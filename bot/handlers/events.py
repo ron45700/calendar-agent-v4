@@ -996,28 +996,20 @@ async def process_multi_event_update(
             failures.append("⚠️ פריט ללא `original_event_hint` — דולג")
             continue
 
-        # 1. Search for the event
-        try:
-            search_result = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, lambda h=hint: calendar_service.search_events(
-                        tokens, query=h, user_id=str(user_id)
-                    )
-                ), timeout=10
-            )
-        except asyncio.TimeoutError:
-            failures.append(f"⏳ *{hint}* — timeout בחיפוש")
-            continue
-        except Exception as e:
-            logger.error(f"[MultiUpdate] Search error for '{hint}': {e}")
+        time_from = item.get("time_hint_from")
+        time_to = item.get("time_hint_to") or time_from
+
+        # Phase 4: Broad fetch + local filter
+        logger.info(f"[MultiUpdate] FetchFilter hint='{hint}' from={time_from} to={time_to}")
+        status, events = await _fetch_and_filter_events(tokens, hint, time_from, time_to, user_id)
+
+        if status == "auth":
+            failures.append(f"🔐 *{hint}* — ההרשאה פגה")
+            break
+        if status in ("error", "timeout"):
             failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
             continue
 
-        if search_result.get("status") != "success":
-            failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
-            continue
-
-        events = search_result.get("events", [])
         if len(events) == 0:
             failures.append(f"🔍 *{hint}* — לא נמצא ביומן")
             continue
@@ -1131,28 +1123,20 @@ async def process_multi_event_delete(
             failures.append("⚠️ פריט ללא `original_event_hint` — דולג")
             continue
 
-        # 1. Search for the event
-        try:
-            search_result = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, lambda h=hint: calendar_service.search_events(
-                        tokens, query=h, user_id=str(user_id)
-                    )
-                ), timeout=10
-            )
-        except asyncio.TimeoutError:
-            failures.append(f"⏳ *{hint}* — timeout בחיפוש")
-            continue
-        except Exception as e:
-            logger.error(f"[MultiDelete] Search error for '{hint}': {e}")
+        time_from = item.get("time_hint_from")
+        time_to = item.get("time_hint_to") or time_from
+
+        # Phase 4: Broad fetch + local filter
+        logger.info(f"[MultiDelete] FetchFilter hint='{hint}' from={time_from} to={time_to}")
+        status, events = await _fetch_and_filter_events(tokens, hint, time_from, time_to, user_id)
+
+        if status == "auth":
+            failures.append(f"🔐 *{hint}* — ההרשאה פגה")
+            break
+        if status in ("error", "timeout"):
             failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
             continue
 
-        if search_result.get("status") != "success":
-            failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
-            continue
-
-        events = search_result.get("events", [])
         if len(events) == 0:
             failures.append(f"🔍 *{hint}* — לא נמצא ביומן")
             continue

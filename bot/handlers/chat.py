@@ -411,13 +411,25 @@ async def process_user_intent(
         await message.answer("❌ שגיאה בתקשורת עם OpenAI. נסה שוב.")
         return
     
-    intent = result.get("intent", "chat")
+    # =========================================================================
+    # PILLAR 6: Hybrid Action Routing (Always-Array Architecture)
+    # =========================================================================
+    actions = result.get("actions", [])
     response_text = result.get("response_text", "")
-    payload = result.get("payload", {})
     
-    logger.info(f"[Intent] Classified as: {intent}")
+    logger.info(f"[Intent] Received {len(actions)} action(s)")
     logger.info(f"[Intent] Response text: {response_text[:100] if response_text else 'EMPTY'}...")
-    logger.info(f"[Intent] Payload: {payload}")
+    
+    # Safety: If LLM didn't follow schema, reject
+    if not actions:
+        logger.error(f"❌ [Intent] LLM returned empty actions array")
+        if thinking_msg:
+            try:
+                await thinking_msg.delete()
+            except:
+                pass
+        await message.answer("❌ שגיאה בעיבוד הבקשה. נסה שוב.")
+        return
     
     # Delete thinking message
     if thinking_msg:
@@ -428,398 +440,418 @@ async def process_user_intent(
             logger.warning(f"[UI] Failed to delete thinking message: {e}")
     
     # =========================================================================
-    # Intent Routing
+    # Deduplication: drop consecutive actions with identical intent+payload
+    # (LLM occasionally returns the same action twice, causing double messages)
     # =========================================================================
+    import json as _json
+    seen_signatures: set = set()
+    deduped_actions = []
+    for _action in actions:
+        _sig = (_action.get("intent", ""), _json.dumps(_action.get("payload", {}), sort_keys=True))
+        if _sig not in seen_signatures:
+            seen_signatures.add(_sig)
+            deduped_actions.append(_action)
+        else:
+            logger.warning(f"[Dedup] Dropping duplicate action: intent={_sig[0]}")
+    actions = deduped_actions
+
+    # =========================================================================
+    # Action Loop: Process each action independently
+    # =========================================================================
+    for idx, action in enumerate(actions, 1):
+        intent = action.get("intent", "chat")
+        payload = action.get("payload", {})
+        
+        logger.info(f"[Action {idx}/{len(actions)}] Intent: {intent}, Payload: {payload}")
+        
+        if intent == "create_event":
+            logger.info(f"[Routing] -> create_event")
+            # Guard: LLM may nest events_batch inside payload — check both levels
+            events_batch = action.get("events_batch") or payload.get("events_batch", [])
+            if events_batch:
+                logger.info(f"[Routing] -> multi-event batch ({len(events_batch)} events)")
+                await process_multi_event_creation(message, user, state, events_batch, response_text)
+            else:
+                await process_create_event(message, user, state, payload, response_text)
     
-    if intent == "create_event":
-        logger.info(f"[Routing] -> create_event")
-        # Guard: LLM sometimes nests events_batch inside payload instead of root
-        events_batch = result.get("events_batch") or payload.get("events_batch", [])
-        if events_batch:
-            logger.info(f"[Routing] -> multi-event batch ({len(events_batch)} events)")
-            await process_multi_event_creation(message, user, state, events_batch, response_text)
-        else:
-            await process_create_event(message, user, state, payload, response_text)
+        elif intent == "start_onboarding":
+            logger.info(f"[Routing] -> start_onboarding")
+            await state.clear()  # clear any active FSM state before starting fresh
+            firestore_service.save_message(user_id, "assistant", response_text)
+            await message.answer(response_text)  # send LLM's warm acknowledgement first
+            await send_onboarding_intro(message, state)
 
+        elif intent == "show_preferences":
+            logger.info(f"[Routing] -> show_preferences")
 
-    elif intent == "start_onboarding":
-        logger.info(f"[Routing] -> start_onboarding")
-        await state.clear()  # clear any active FSM state before starting fresh
-        firestore_service.save_message(user_id, "assistant", response_text)
-        await message.answer(response_text)  # send LLM's warm acknowledgement first
-        await send_onboarding_intro(message, state)
+            personal = user.get("personal_info", {})
+            nickname = personal.get("nickname") or personal.get("name") or "לא נקבע"
+            agent_name = personal.get("agent_nickname") or personal.get("agent_name") or "לא נקבע"
 
-    elif intent == "show_preferences":
-        logger.info(f"[Routing] -> show_preferences")
+            contacts = user.get("contacts", {})
+            color_map = user.get("calendar_config", {}).get("color_map", {})
+            prefs = user.get("preferences", {})
+            reminder_mode = prefs.get("reminder_mode", False)
+            daily_briefing = prefs.get("daily_briefing", False)
 
-        personal = user.get("personal_info", {})
-        nickname = personal.get("nickname") or personal.get("name") or "לא נקבע"
-        agent_name = personal.get("agent_nickname") or personal.get("agent_name") or "לא נקבע"
+            # --- Color ID → Hebrew name map ---
+            COLOR_ID_HEBREW = {
+                "1": "לבנדר", "2": "מרווה", "3": "סגול",
+                "4": "פלמינגו", "5": "בננה", "6": "כתום",
+                "7": "תכלת", "8": "אפור כהה", "9": "כחול",
+                "10": "ירוק", "11": "אדום",
+            }
+            CATEGORY_HEB = {
+                "work": "עבודה", "meeting": "פגישות", "personal": "אישי",
+                "sport": "ספורט", "study": "לימודים", "health": "בריאות",
+                "family": "משפחה", "fun": "בילויים", "general": "כללי",
+            }
 
-        contacts = user.get("contacts", {})
-        color_map = user.get("calendar_config", {}).get("color_map", {})
-        prefs = user.get("preferences", {})
-        reminder_mode = prefs.get("reminder_mode", False)
-        daily_briefing = prefs.get("daily_briefing", False)
+            # --- Build message ---
+            lines = [
+                f"📤 *הפרופיל שלך*",
+                "",
+                f"👤 *השם שלך:* {nickname}",
+                f"🤖 *שם הבוט:* {agent_name}",
+            ]
 
-        # --- Color ID → Hebrew name map ---
-        COLOR_ID_HEBREW = {
-            "1": "לבנדר", "2": "מרווה", "3": "סגול",
-            "4": "פלמינגו", "5": "בננה", "6": "כתום",
-            "7": "תכלת", "8": "אפור כהה", "9": "כחול",
-            "10": "ירוק", "11": "אדום",
-        }
-        CATEGORY_HEB = {
-            "work": "עבודה", "meeting": "פגישות", "personal": "אישי",
-            "sport": "ספורט", "study": "לימודים", "health": "בריאות",
-            "family": "משפחה", "fun": "בילויים", "general": "כללי",
-        }
+            # Daily features
+            lines += [
+                "",
+                f"☀️ *הצגת הלוז בבוקר:* {'מופעל ✅' if daily_briefing else 'כבוי 🔕'}\n",
+                f"🔔 *הוספת 'תזכורת' לאירועים:* {'מופעל ✅' if reminder_mode else 'כבוי 🔕'}",
+            ]
 
-        # --- Build message ---
-        lines = [
-            f"📤 *הפרופיל שלך*",
-            "",
-            f"👤 *השם שלך:* {nickname}",
-            f"🤖 *שם הבוט:* {agent_name}",
-        ]
+            # Contacts
+            lines.append("")
+            if contacts:
+                lines.append(f"👥 *אנשי קשר ({len(contacts)}):*")
+                for name, email in contacts.items():
+                    lines.append(f"  • {name} — `{email}`")
+            else:
+                lines.append("👥 *אנשי קשר:* לא נוספו עדיין")
 
-        # Daily features
-        lines += [
-    "",
-    f"☀️ *הצגת הלוז בבוקר:* {'מופעל ✅' if daily_briefing else 'כבוי 🔕'}\n",
-    f"🔔 *הוספת 'תזכורת' לאירועים:* {'מופעל ✅' if reminder_mode else 'כבוי 🔕'}",
-]
+            # Custom colors
+            lines.append("")
+            custom_colors = {k: v for k, v in color_map.items() if not k.startswith("_")}
+            if custom_colors:
+                lines.append("🎨 *צבעי קטגוריה:*")
+                for cat, cid in custom_colors.items():
+                    cat_heb = CATEGORY_HEB.get(cat, cat)
+                    color_heb = COLOR_ID_HEBREW.get(str(cid), str(cid))
+                    lines.append(f"  • {cat_heb} → {color_heb}")
+            else:
+                lines.append("🎨 *צבעים:* ברירת מחדל לכלה (תכלת)")
 
-        # Contacts
-        lines.append("")
-        if contacts:
-            lines.append(f"👥 *אנשי קשר ({len(contacts)}):*")
-            for name, email in contacts.items():
-                lines.append(f"  • {name} — `{email}`")
-        else:
-            lines.append("👥 *אנשי קשר:* לא נוספו עדיין")
+            lines += [
+                "",
+                "💡 _לשנות הגדרות פשוט תגיד לי מה לשנות!_",
+            ]
 
-        # Custom colors
-        lines.append("")
-        custom_colors = {k: v for k, v in color_map.items() if not k.startswith("_")}
-        if custom_colors:
-            lines.append("🎨 *צבעי קטגוריה:*")
-            for cat, cid in custom_colors.items():
-                cat_heb = CATEGORY_HEB.get(cat, cat)
-                color_heb = COLOR_ID_HEBREW.get(str(cid), str(cid))
-                lines.append(f"  • {cat_heb} → {color_heb}")
-        else:
-            lines.append("🎨 *צבעים:* ברירת מחדל לכלה (תכלת)")
+            pref_msg = "\n".join(lines)
+            firestore_service.save_message(user_id, "assistant", pref_msg)
+            await message.answer(pref_msg, parse_mode="Markdown")
 
-        lines += [
-            "",
-            "💡 _לשנות הגדרות פשוט תגיד לי מה לשנות!_",
-        ]
+        elif intent == "get_events":
+            logger.info(f"[Routing] -> get_events")
 
-        pref_msg = "\n".join(lines)
-        firestore_service.save_message(user_id, "assistant", pref_msg)
-        await message.answer(pref_msg, parse_mode="Markdown")
+            tokens = user.get("calendar_config", {})
+            payload_data = payload  # use local alias to avoid shadowing outer `payload`
 
-    elif intent == "get_events":
-        logger.info(f"[Routing] -> get_events")
-
-        tokens = user.get("calendar_config", {})
-        payload_data = payload  # use local alias to avoid shadowing outer `payload`
-
-        # --- Proactive Clarification: ask before searching if no timeframe given ---
-        if payload_data.get("needs_clarification"):
-            entity_name = payload_data.get("entity_name", "")
-            await state.update_data(
-                search_entity=entity_name,
-                search_response_text=response_text
-            )
-            from bot.states import SearchFlowStates
-            await state.set_state(SearchFlowStates.WAITING_FOR_TIMEFRAME)
-
-            clarify_msg = (
-                f"🔍 מחפש אירועים{f' עם {entity_name}' if entity_name else ''}.\n\n"
-                f"באיזה טווח למחפש? 📅\n"
-                f"• *השבוע הזה*\n"
-                f"• *החודש הזה*\n"
-                f"• *תאריך ספציפי* (כתוב תאריך)"
-            )
-            firestore_service.save_message(user_id, "assistant", clarify_msg)
-            await message.answer(clarify_msg, parse_mode="Markdown")
-            return
-
-        # --- Build time window from payload fields ---
-        from datetime import timezone
-        from zoneinfo import ZoneInfo
-        ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
-        today = datetime.now(ISRAEL_TZ).date()
-
-        date_from_str = payload_data.get("date_from")
-        date_to_str = payload_data.get("date_to")
-        time_range = payload_data.get("time_range", "")
-        entity_name = payload_data.get("entity_name", "")
-
-        # Derive time_min / time_max
-        if date_from_str and date_to_str:
-            try:
-                from datetime import date as date_cls
-                d_from = date_cls.fromisoformat(date_from_str)
-                d_to = date_cls.fromisoformat(date_to_str)
-                time_min = datetime(d_from.year, d_from.month, d_from.day, tzinfo=ISRAEL_TZ).isoformat()
-                time_max = datetime(d_to.year, d_to.month, d_to.day, 23, 59, 59, tzinfo=ISRAEL_TZ).isoformat()
-            except Exception:
-                time_min = time_max = None
-        else:
-            time_min = time_max = None  # calendar_service will use defaults (today → +30d)
-
-        try:
-            # --- Entity search: use search_events() for targeted queries ---
-            if entity_name:
-                result = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None, lambda: calendar_service.search_events(
-                            tokens,
-                            query=entity_name,
-                            time_min=time_min,
-                            time_max=time_max,
-                            max_results=15,
-                            user_id=str(user_id)
-                        )
-                    ), timeout=10
+            # --- Proactive Clarification: ask before searching if no timeframe given ---
+            if payload_data.get("needs_clarification"):
+                entity_name = payload_data.get("entity_name", "")
+                await state.update_data(
+                    search_entity=entity_name,
+                    search_response_text=response_text
                 )
+                from bot.states import SearchFlowStates
+                await state.set_state(SearchFlowStates.WAITING_FOR_TIMEFRAME)
 
-                events = result.get("events", []) if result.get("status") == "success" else []
+                clarify_msg = (
+                    f"🔍 מחפש אירועים{f' עם {entity_name}' if entity_name else ''}.\n\n"
+                    f"באיזה טווח למחפש? 📅\n"
+                    f"• *השבוע הזה*\n"
+                    f"• *החודש הזה*\n"
+                    f"• *תאריך ספציפי* (כתוב תאריך)"
+                )
+                firestore_service.save_message(user_id, "assistant", clarify_msg)
+                await message.answer(clarify_msg, parse_mode="Markdown")
+                return
 
-                # --- Fuzzy fallback: expand ±2 days if nothing found in exact range ---
-                if not events and time_min and time_max:
-                    logger.info(f"[Search] No results for '{entity_name}', expanding ±2 days")
-                    from datetime import timedelta as td
-                    expanded_min = (datetime.fromisoformat(time_min) - td(days=2)).isoformat()
-                    expanded_max = (datetime.fromisoformat(time_max) + td(days=2)).isoformat()
-                    expanded_result = await asyncio.wait_for(
+            # --- Build time window from payload fields ---
+            from datetime import timezone
+            from zoneinfo import ZoneInfo
+            ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+            today = datetime.now(ISRAEL_TZ).date()
+
+            date_from_str = payload_data.get("date_from")
+            date_to_str = payload_data.get("date_to")
+            time_range = payload_data.get("time_range", "")
+            entity_name = payload_data.get("entity_name", "")
+
+            # Derive time_min / time_max
+            if date_from_str and date_to_str:
+                try:
+                    from datetime import date as date_cls
+                    d_from = date_cls.fromisoformat(date_from_str)
+                    d_to = date_cls.fromisoformat(date_to_str)
+                    time_min = datetime(d_from.year, d_from.month, d_from.day, tzinfo=ISRAEL_TZ).isoformat()
+                    time_max = datetime(d_to.year, d_to.month, d_to.day, 23, 59, 59, tzinfo=ISRAEL_TZ).isoformat()
+                except Exception:
+                    time_min = time_max = None
+            else:
+                time_min = time_max = None  # calendar_service will use defaults (today → +30d)
+
+            try:
+                # --- Entity search: use search_events() for targeted queries ---
+                if entity_name:
+                    result = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
                             None, lambda: calendar_service.search_events(
                                 tokens,
                                 query=entity_name,
-                                time_min=expanded_min,
-                                time_max=expanded_max,
+                                time_min=time_min,
+                                time_max=time_max,
                                 max_results=15,
                                 user_id=str(user_id)
                             )
                         ), timeout=10
                     )
-                    events = expanded_result.get("events", []) if expanded_result.get("status") == "success" else []
-                    if events:
-                        # Prepend a notice that we widened the search
-                        events_response = f"🔍 לא מצאתי '{entity_name}' בטווח שביקשת, אבל מצאתי בתאריכים קרובים:\n\n"
-                        events_response += calendar_service.format_search_results(events, entity_name)
-                    else:
-                        # Still nothing — suggest upcoming events
-                        upcoming = await asyncio.wait_for(
+
+                    events = result.get("events", []) if result.get("status") == "success" else []
+
+                    # --- Fuzzy fallback: expand ±2 days if nothing found in exact range ---
+                    if not events and time_min and time_max:
+                        logger.info(f"[Search] No results for '{entity_name}', expanding ±2 days")
+                        from datetime import timedelta as td
+                        expanded_min = (datetime.fromisoformat(time_min) - td(days=2)).isoformat()
+                        expanded_max = (datetime.fromisoformat(time_max) + td(days=2)).isoformat()
+                        expanded_result = await asyncio.wait_for(
                             asyncio.get_event_loop().run_in_executor(
-                                None, lambda: calendar_service.get_upcoming_events(
-                                    tokens, max_results=3, user_id=str(user_id)
+                                None, lambda: calendar_service.search_events(
+                                    tokens,
+                                    query=entity_name,
+                                    time_min=expanded_min,
+                                    time_max=expanded_max,
+                                    max_results=15,
+                                    user_id=str(user_id)
                                 )
                             ), timeout=10
                         )
-                        upcoming_events = upcoming.get("events", []) if upcoming.get("status") == "success" else []
-                        events_response = f"🔍 לא מצאתי אירועים עם '{entity_name}'.\n\n"
-                        if upcoming_events:
-                            formatted_upcoming = calendar_service.format_today_events(upcoming_events)
-                            events_response += f"אבל הנה מה שמגיע בקרוב:\n{formatted_upcoming}"
+                        events = expanded_result.get("events", []) if expanded_result.get("status") == "success" else []
+                        if events:
+                            # Prepend a notice that we widened the search
+                            events_response = f"🔍 לא מצאתי '{entity_name}' בטווח שביקשת, אבל מצאתי בתאריכים קרובים:\n\n"
+                            events_response += calendar_service.format_search_results(events, entity_name)
                         else:
-                            events_response += "גם אין אירועים קרובים אחרים."
-                else:
-                    if events:
-                        events_response = f"📅 *אירועים עם {entity_name}:*\n\n"
-                        events_response += calendar_service.format_search_results(events, entity_name)
-                    else:
-                        events_response = f"🔍 לא מצאתי אירועים עם '{entity_name}' בטווח הזמן המבוקש."
-
-            # --- Standard schedule fetch (no entity) ---
-            else:
-                if time_range == "today" or (not time_range and not date_from_str):
-                    result = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None, lambda: calendar_service.get_today_events(tokens, user_id=str(user_id))
-                        ), timeout=10
-                    )
-                    range_label = "היום"
-                else:
-                    result = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None, lambda: calendar_service.get_upcoming_events(
-                                tokens, max_results=15, user_id=str(user_id),
-                                time_min=time_min, time_max=time_max
+                            # Still nothing — suggest upcoming events
+                            upcoming = await asyncio.wait_for(
+                                asyncio.get_event_loop().run_in_executor(
+                                    None, lambda: calendar_service.get_upcoming_events(
+                                        tokens, max_results=3, user_id=str(user_id)
+                                    )
+                                ), timeout=10
                             )
-                        ), timeout=10
-                    )
-                    range_label = {
-                        "tomorrow": "מחר", "week": "השבוע", "month": "החודש"
-                    }.get(time_range, "הקרובים")
-                    if date_from_str and date_to_str and date_from_str != date_to_str:
-                        range_label = f"{date_from_str} עד {date_to_str}"
-
-                if result.get("status") != "success":
-                    if result.get("type") == "auth_required":
-                        events_response = "🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש."
+                            upcoming_events = upcoming.get("events", []) if upcoming.get("status") == "success" else []
+                            events_response = f"🔍 לא מצאתי אירועים עם '{entity_name}'.\n\n"
+                            if upcoming_events:
+                                formatted_upcoming = calendar_service.format_today_events(upcoming_events)
+                                events_response += f"אבל הנה מה שמגיע בקרוב:\n{formatted_upcoming}"
+                            else:
+                                events_response += "גם אין אירועים קרובים אחרים."
                     else:
-                        events_response = "❌ שגיאה בגישה ליומן. נסה שוב בעוד כמה דקות."
+                        if events:
+                            events_response = f"📅 *אירועים עם {entity_name}:*\n\n"
+                            events_response += calendar_service.format_search_results(events, entity_name)
+                        else:
+                            events_response = f"🔍 לא מצאתי אירועים עם '{entity_name}' בטווח הזמן המבוקש."
+
+                # --- Standard schedule fetch (no entity) ---
                 else:
-                    events = result.get("events", [])
-                    formatted = calendar_service.format_today_events(events)
-                    if formatted:
-                        events_response = f"📅 *האירועים שלך ל{range_label}:*\n\n{formatted}"
+                    if time_range == "today" or (not time_range and not date_from_str):
+                        result = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, lambda: calendar_service.get_today_events(tokens, user_id=str(user_id))
+                            ), timeout=10
+                        )
+                        range_label = "היום"
                     else:
-                        events_response = f"📅 אין אירועים מתוכננים ל{range_label}! 🎉 היום שלך פנוי."
+                        result = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, lambda: calendar_service.get_upcoming_events(
+                                    tokens, max_results=15, user_id=str(user_id),
+                                    time_min=time_min, time_max=time_max
+                                )
+                            ), timeout=10
+                        )
+                        range_label = {
+                            "tomorrow": "מחר", "week": "השבוע", "month": "החודש"
+                        }.get(time_range, "הקרובים")
+                        if date_from_str and date_to_str and date_from_str != date_to_str:
+                            range_label = f"{date_from_str} עד {date_to_str}"
 
-        except asyncio.TimeoutError:
-            logger.error(f"❌ [Calendar] Timeout fetching events for user {user_id}")
-            events_response = "⏳ Google Calendar לא הגיב בזמן.\nנסה שוב בעוד רגע."
-        except Exception as e:
-            logger.error(f"❌ [Calendar] Error fetching events: {e}")
-            import traceback
-            traceback.print_exc()
-            events_response = "❌ שגיאה בשליפת האירועים. נסה שוב."
+                    if result.get("status") != "success":
+                        if result.get("type") == "auth_required":
+                            events_response = "🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש."
+                        else:
+                            events_response = "❌ שגיאה בגישה ליומן. נסה שוב בעוד כמה דקות."
+                    else:
+                        events = result.get("events", [])
+                        formatted = calendar_service.format_today_events(events)
+                        if formatted:
+                            events_response = f"📅 *האירועים שלך ל{range_label}:*\n\n{formatted}"
+                        else:
+                            events_response = f"📅 אין אירועים מתוכננים ל{range_label}! 🎉 היום שלך פנוי."
 
-        firestore_service.save_message(user_id, "assistant", events_response)
-        await message.answer(events_response, parse_mode="Markdown")
-    
-    elif intent == "set_reminder":
-        # set_reminder is always re-routed to create_event.
-        # The payload carries original_intent="set_reminder" so process_create_event
-        # can apply the reminder prefix + color based on the user's reminder_mode toggle.
-        logger.info(f"[Routing] -> set_reminder (re-routing to create_event)")
-        await process_create_event(message, user, state, payload, response_text)
-    
-    elif intent == "update_event":
-        logger.info(f"[Routing] -> update_event")
-        # Guard: LLM may nest update_batch inside payload — check both levels
-        update_batch = result.get("update_batch") or payload.get("update_batch", [])
-        if update_batch:
-            logger.info(f"[Routing] -> multi-event update batch ({len(update_batch)} items)")
-            await process_multi_event_update(message, user, state, update_batch, response_text)
-        else:
-            await process_update_event(message, user, state, payload, response_text)
+            except asyncio.TimeoutError:
+                logger.error(f"❌ [Calendar] Timeout fetching events for user {user_id}")
+                events_response = "⏳ Google Calendar לא הגיב בזמן.\nנסה שוב בעוד רגע."
+            except Exception as e:
+                logger.error(f"❌ [Calendar] Error fetching events: {e}")
+                import traceback
+                traceback.print_exc()
+                events_response = "❌ שגיאה בשליפת האירועים. נסה שוב."
 
-    elif intent == "delete_event":
-        logger.info(f"[Routing] -> delete_event")
-        # Guard: LLM may nest delete_batch inside payload — check both levels
-        delete_batch = result.get("delete_batch") or payload.get("delete_batch", [])
-        if delete_batch:
-            logger.info(f"[Routing] -> multi-event delete batch ({len(delete_batch)} items)")
-            await process_multi_event_delete(message, user, state, delete_batch, response_text)
-        else:
-            await process_delete_event(message, user, state, payload, response_text)
-
-    elif intent == "edit_preferences":
-        logger.info(f"[Routing] -> edit_preferences")
+            firestore_service.save_message(user_id, "assistant", events_response)
+            await message.answer(events_response, parse_mode="Markdown")
         
-        # --- Fix #1: Smart Routing — process payload directly ---
-        handled = False
+        elif intent == "set_reminder":
+            # set_reminder is always re-routed to create_event.
+            # The payload carries original_intent="set_reminder" so process_create_event
+            # can apply the reminder prefix + color based on the user's reminder_mode toggle.
+            logger.info(f"[Routing] -> set_reminder (re-routing to create_event)")
+            await process_create_event(message, user, state, payload, response_text)
         
-        # Daily briefing toggle
-        if "daily_briefing" in payload:
-            new_value = bool(payload["daily_briefing"])
-            firestore_service.update_user(user_id, {
-                "preferences.daily_briefing": new_value
-            })
-            status_text = "מופעל ☀️" if new_value else "כבוי 🌙"
-            prefs_response = f"✅ דיווח יומי עודכן: **{status_text}**"
-            if new_value:
-                prefs_response += "\nמחר ב-08:00 תקבל ממני סיכום של הלו\"ז שלך!"
-            handled = True
-
-        # Reminder mode toggle
-        elif "reminder_mode" in payload:
-            new_value = bool(payload["reminder_mode"])
-            firestore_service.update_user(user_id, {
-                "preferences.reminder_mode": new_value
-            })
-            if new_value:
-                prefs_response = (
-                    "✅ *מצב תזכורות הופעל!* 🔔\n\n"
-                    "מעכשיו כשתגיד \"תזכיר ליל\", אקבע אוטומטית \u05d0ירוע עם הקדימה *תזכורת: * ובצבע 👊 כתום."
-                )
+        elif intent == "update_event":
+            logger.info(f"[Routing] -> update_event")
+            # Guard: LLM may nest update_batch inside payload — check both levels
+            update_batch = action.get("update_batch") or payload.get("update_batch", [])
+            if update_batch:
+                logger.info(f"[Routing] -> multi-event update batch ({len(update_batch)} items)")
+                await process_multi_event_update(message, user, state, update_batch, response_text)
             else:
-                prefs_response = (
-                    "✅ *מצב תזכורות כבוי.* 😴\n\n"
-                    "תזכורות יישמרו כאירועי לוח רגילים ללא קידומת וללא צבע מיוחד."
+                await process_update_event(message, user, state, payload, response_text)
+
+        elif intent == "delete_event":
+            logger.info(f"[Routing] -> delete_event")
+            # Guard: LLM may nest delete_batch inside payload — check both levels
+            delete_batch = action.get("delete_batch") or payload.get("delete_batch", [])
+            if delete_batch:
+                logger.info(f"[Routing] -> multi-event delete batch ({len(delete_batch)} items)")
+                await process_multi_event_delete(message, user, state, delete_batch, response_text)
+            else:
+                await process_delete_event(message, user, state, payload, response_text)
+
+        elif intent == "edit_preferences":
+            logger.info(f"[Routing] -> edit_preferences")
+            
+            # --- Fix #1: Smart Routing — process payload directly ---
+            handled = False
+            
+            # Daily briefing toggle
+            if "daily_briefing" in payload:
+                new_value = bool(payload["daily_briefing"])
+                firestore_service.update_user(user_id, {
+                    "preferences.daily_briefing": new_value
+                })
+                status_text = "מופעל ☀️" if new_value else "כבוי 🌙"
+                prefs_response = f"✅ דיווח יומי עודכן: **{status_text}**"
+                if new_value:
+                    prefs_response += "\nמחר ב-08:00 תקבל ממני סיכום של הלו\"ז שלך!"
+                handled = True
+
+            # Reminder mode toggle
+            elif "reminder_mode" in payload:
+                new_value = bool(payload["reminder_mode"])
+                firestore_service.update_user(user_id, {
+                    "preferences.reminder_mode": new_value
+                })
+                if new_value:
+                    prefs_response = (
+                        "✅ *מצב תזכורות הופעל!* 🔔\n\n"
+                        "מעכשיו כשתגיד \"תזכיר ליל\", אקבע אוטומטית \u05d0ירוע עם הקדימה *תזכורת: * ובצבע 👊 כתום."
+                    )
+                else:
+                    prefs_response = (
+                        "✅ *מצב תזכורות כבוי.* 😴\n\n"
+                        "תזכורות יישמרו כאירועי לוח רגילים ללא קידומת וללא צבע מיוחד."
+                    )
+                handled = True
+            
+            # Nickname change
+            elif payload.get("nickname"):
+                new_nick = payload["nickname"]
+                firestore_service.update_user(user_id, {
+                    "personal_info.nickname": new_nick
+                })
+                prefs_response = f"✅ עודכן! מעכשיו אתה *{new_nick}* 🔥"
+                handled = True
+            
+            # Agent name change
+            elif payload.get("agent_name"):
+                new_name = payload["agent_name"]
+                firestore_service.update_user(user_id, {
+                    "personal_info.bot_name": new_name
+                })
+                prefs_response = f"✅ אתחול מערכות... 🤖 נעים מאוד, אני *{new_name}*!"
+                handled = True
+            
+            # Colors update
+            elif payload.get("colors"):
+                color_updates = payload["colors"]
+                update_dict = {f"calendar_config.color_map.{cat}": color for cat, color in color_updates.items()}
+                firestore_service.update_user(user_id, update_dict)
+                prefs_response = "✅ צבעים עודכנו! 🎨"
+                handled = True
+            
+            # Contacts update
+            elif payload.get("contacts"):
+                contact_updates = payload["contacts"]
+                update_dict = {f"contacts.{name}": email for name, email in contact_updates.items()}
+                firestore_service.update_user(user_id, update_dict)
+                names = ", ".join(contact_updates.keys())
+                prefs_response = f"✅ {names} נוספו לאנשי הקשר! 📇"
+                handled = True
+            
+            if not handled:
+                # Fallback: no specific payload, redirect to settings
+                prefs_response = response_text if response_text else (
+                    f"⚙️ אני רואה שאתה רוצה לשנות הגדרות.\n\n"
+                    f"שלח /settings לעדכון ההגדרות."
                 )
-            handled = True
+            
+            logger.info(f"[Firestore] Saving assistant response")
+            firestore_service.save_message(user_id, "assistant", prefs_response)
+            
+            logger.info(f"📤 [Telegram] Sending response...")
+            await message.answer(prefs_response, parse_mode="Markdown")
+            logger.info(f"✅ [Telegram] Response sent!")
         
-        # Nickname change
-        elif payload.get("nickname"):
-            new_nick = payload["nickname"]
-            firestore_service.update_user(user_id, {
-                "personal_info.nickname": new_nick
-            })
-            prefs_response = f"✅ עודכן! מעכשיו אתה *{new_nick}* 🔥"
-            handled = True
+        elif intent == "admin_test":
+            # User asked to run tests (e.g. "בוא נריץ בדיקות") — ask for password
+            logger.info(f"[Routing] -> admin_test (request password)")
+            if not ADMIN_TEST_ENABLED:
+                await message.answer("❌ סוויטת הבדיקות כרגע לא פעילה.")
+            else:
+                admin_msg = "לסוויטת הבדיקות רק האדמין יכול להיכנס, תוכיח שאתה אדמיני בכתיבת הססמא הסודית"
+                firestore_service.save_message(user_id, "assistant", admin_msg)
+                await message.answer(admin_msg)
+                await state.set_state(AdminTestStates.WAITING_FOR_PASSWORD)
         
-        # Agent name change
-        elif payload.get("agent_name"):
-            new_name = payload["agent_name"]
-            firestore_service.update_user(user_id, {
-                "personal_info.bot_name": new_name
-            })
-            prefs_response = f"✅ אתחול מערכות... 🤖 נעים מאוד, אני *{new_name}*!"
-            handled = True
-        
-        # Colors update
-        elif payload.get("colors"):
-            color_updates = payload["colors"]
-            update_dict = {f"calendar_config.color_map.{cat}": color for cat, color in color_updates.items()}
-            firestore_service.update_user(user_id, update_dict)
-            prefs_response = "✅ צבעים עודכנו! 🎨"
-            handled = True
-        
-        # Contacts update
-        elif payload.get("contacts"):
-            contact_updates = payload["contacts"]
-            update_dict = {f"contacts.{name}": email for name, email in contact_updates.items()}
-            firestore_service.update_user(user_id, update_dict)
-            names = ", ".join(contact_updates.keys())
-            prefs_response = f"✅ {names} נוספו לאנשי הקשר! 📇"
-            handled = True
-        
-        if not handled:
-            # Fallback: no specific payload, redirect to settings
-            prefs_response = response_text if response_text else (
-                f"⚙️ אני רואה שאתה רוצה לשנות הגדרות.\n\n"
-                f"שלח /settings לעדכון ההגדרות."
-            )
-        
-        logger.info(f"[Firestore] Saving assistant response")
-        firestore_service.save_message(user_id, "assistant", prefs_response)
-        
-        logger.info(f"📤 [Telegram] Sending response...")
-        await message.answer(prefs_response, parse_mode="Markdown")
-        logger.info(f"✅ [Telegram] Response sent!")
-    
-    elif intent == "admin_test":
-        # User asked to run tests (e.g. "בוא נריץ בדיקות") — ask for password
-        logger.info(f"[Routing] -> admin_test (request password)")
-        if not ADMIN_TEST_ENABLED:
-            await message.answer("❌ סוויטת הבדיקות כרגע לא פעילה.")
         else:
-            admin_msg = "לסוויטת הבדיקות רק האדמין יכול להיכנס, תוכיח שאתה אדמיני בכתיבת הססמא הסודית"
-            firestore_service.save_message(user_id, "assistant", admin_msg)
-            await message.answer(admin_msg)
-            await state.set_state(AdminTestStates.WAITING_FOR_PASSWORD)
-    
-    else:
-        # General chat
-        logger.info(f"[Routing] -> chat (general)")
-        
-        if not response_text:
-            logger.error(f"❌ [Chat] Empty response_text from OpenAI!")
-            response_text = "סליחה, לא הבנתי. אפשר לנסח אחרת?"
-        
-        logger.info(f"[Firestore] Saving assistant response")
-        firestore_service.save_message(user_id, "assistant", response_text)
-        
-        logger.info(f"📤 [Telegram] Sending response: {response_text[:50]}...")
-        await message.answer(response_text)
-        logger.info(f"✅ [Telegram] Response sent!")
+            # General chat
+            logger.info(f"[Routing] -> chat (general)")
+            
+            if not response_text:
+                logger.error(f"❌ [Chat] Empty response_text from OpenAI!")
+                response_text = "סליחה, לא הבנתי. אפשר לנסח אחרת?"
+            
+            logger.info(f"[Firestore] Saving assistant response")
+            firestore_service.save_message(user_id, "assistant", response_text)
+            
+            logger.info(f"📤 [Telegram] Sending response: {response_text[:50]}...")
+            await message.answer(response_text)
+            logger.info(f"✅ [Telegram] Response sent!")
     
     logger.info(f"[Intent] Processing complete for user {user_id}")

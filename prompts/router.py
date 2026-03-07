@@ -21,7 +21,21 @@ You are processing messages from {user_nickname}.
 
 ## YOUR TASK
 
-Classify the user's intent and extract relevant structured data.
+Classify the user's intent(s) and extract relevant structured data.
+
+⚠️ **CRITICAL - ALWAYS-ARRAY ARCHITECTURE:**
+- **ALWAYS** return an `actions` array, even for single tasks
+- Each action = `{{intent, payload}}` pair
+- Single task: `{{"actions": [{{"intent": "create_event", "payload": {{...}}}}], "response_text": "..."}}`
+- Mixed tasks: `{{"actions": [{{"intent": "update_event", "payload": {{...}}}}, {{"intent": "create_event", "payload": {{...}}}}], "response_text": "..."}}`
+- **NEVER return duplicate identical actions.** If multiple intents are found, each must be distinct. Do not repeat the same intent+payload combination.
+
+⚠️ **CRITICAL - EVENT NAME PRIORITY (Context Safeguard):**
+- Extract event names from the **CURRENT user message ONLY**
+- Use chat history ONLY to resolve pronouns ("it", "that one", "the first") or ordinals ("first", "second")
+- **NEVER** hallucinate old event names from history into new create_event actions
+- Example: If history shows "Gym" but current message says "Add Friday meeting", do NOT create a "Gym" event
+
 **Always** return valid JSON in the specified format.
 
 ---
@@ -500,7 +514,66 @@ Before extracting data into the JSON payload (especially for `summary`, `descrip
 
 ---
 
-Remember: Always return valid JSON. If unsure, use intent `chat`.
+## MIXED-INTENT EXAMPLES (PILLAR 6: HYBRID ACTION ROUTING)
+
+**User:** "שנה את האימון לאדום וגם תקבע פגישה ביום שישי ב-15:00"
+```json
+{{{{
+  "actions": [
+    {{{{"intent": "update_event", "payload": {{{{"original_event_hint": "אימון", "new_color_name": "tomato", "new_color_name_hebrew": "אדום"}}}}}}}},
+    {{{{"intent": "create_event", "payload": {{{{"summary": "פגישה", "start_time": "2026-03-13T15:00:00+02:00", "end_time": "2026-03-13T16:00:00+02:00", "category": "meeting"}}}}}}}}
+  ],
+  "response_text": "מושלם! משנה את צבע האימון לאדום 🔴 וקובע פגישה ביום שישי ב-15:00 📅"
+}}}}
+```
+
+**User:** "Change Gym to red AND add a Friday meeting at 14:00"
+```json
+{{{{
+  "actions": [
+    {{{{"intent": "update_event", "payload": {{{{"original_event_hint": "Gym", "new_color_name": "tomato", "new_color_name_hebrew": "אדום"}}}}}}}},
+    {{{{"intent": "create_event", "payload": {{{{"summary": "פגישה", "start_time": "2026-03-13T14:00:00+02:00", "end_time": "2026-03-13T15:00:00+02:00", "category": "meeting"}}}}}}}}
+  ],
+  "response_text": "Done! Changed Gym to red 🔴 and scheduled Friday meeting at 14:00 📅"
+}}}}
+```
+
+**User:** "תמחק את האימון מחר ותקבע חדש לשבת ב-9"
+```json
+{{{{
+  "actions": [
+    {{{{"intent": "delete_event", "payload": {{{{"original_event_hint": "אימון", "time_hint_from": "2026-03-08", "time_hint_to": "2026-03-08"}}}}}}}},
+    {{{{"intent": "create_event", "payload": {{{{"summary": "אימון", "start_time": "2026-03-14T09:00:00+02:00", "end_time": "2026-03-14T10:00:00+02:00", "category": "sport"}}}}}}}}
+  ],
+  "response_text": "בוצע! מוחק את האימון מחר ומקבע חדש לשבת ב-9:00 💪"
+}}}}
+```
+
+**User:** "תוסיף את דני לפגישה מחר ותשנה את הצבע לירוק"
+```json
+{{{{
+  "actions": [
+    {{{{"intent": "update_event", "payload": {{{{"original_event_hint": "פגישה", "time_hint_from": "2026-03-08", "time_hint_to": "2026-03-08", "new_attendees": ["דני"]}}}}}}}},
+    {{{{"intent": "update_event", "payload": {{{{"original_event_hint": "פגישה", "time_hint_from": "2026-03-08", "time_hint_to": "2026-03-08", "new_color_name": "basil", "new_color_name_hebrew": "ירוק"}}}}}}}}
+  ],
+  "response_text": "עדכנתי! מוסיף את דני לפגישה ומשנה את הצבע לירוק 💚"
+}}}}
+```
+
+**User:** "תבטל את רופא השיניים ביום חמישי ותקבע אימון ביום שני ב-18"
+```json
+{{{{
+  "actions": [
+    {{{{"intent": "delete_event", "payload": {{{{"original_event_hint": "רופא השיניים", "time_hint_from": "2026-03-12", "time_hint_to": "2026-03-12"}}}}}}}},
+    {{{{"intent": "create_event", "payload": {{{{"summary": "אימון", "start_time": "2026-03-09T18:00:00+02:00", "end_time": "2026-03-09T19:00:00+02:00", "category": "sport"}}}}}}}}
+  ],
+  "response_text": "סודר! מבטל את רופא השיניים ומקבע אימון ביום שני ב-18:00 ✅"
+}}}}
+```
+
+---
+
+Remember: Always return valid JSON using the `actions` array format. If unsure, use a single action with intent `chat`.
 """
 
 
@@ -510,23 +583,26 @@ Remember: Always return valid JSON. If unsure, use intent `chat`.
 
 INTENT_FUNCTION_SCHEMA = {
     "name": "classify_user_intent",
-    "description": "Classify user intent and extract structured data for Calendar Agent",
+    "description": "Classify user intent(s) and extract structured data for Calendar Agent using ALWAYS-ARRAY architecture",
     "parameters": {
         "type": "object",
         "properties": {
-            "intent": {
-                "type": "string",
-                "enum": ["create_event", "set_reminder", "daily_check_setup", "edit_preferences", "show_preferences", "get_events", "update_event", "delete_event", "start_onboarding", "admin_test", "chat"],
-                "description": "The classified intent of the user's message"
-            },
-            "response_text": {
-                "type": "string",
-                "description": "A natural, friendly Hebrew response to the user"
-            },
-            "payload": {
-                "type": "object",
-                "description": "Intent-specific data payload",
-                "properties": {
+            "actions": {
+                "type": "array",
+                "description": "ALWAYS return an array of actions, even for single tasks. Each action contains an intent and its payload.",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "intent": {
+                            "type": "string",
+                            "enum": ["create_event", "set_reminder", "daily_check_setup", "edit_preferences", "show_preferences", "get_events", "update_event", "delete_event", "start_onboarding", "admin_test", "chat"],
+                            "description": "The classified intent for this action"
+                        },
+                        "payload": {
+                            "type": "object",
+                            "description": "Intent-specific data payload for this action",
+                            "properties": {
                     # Event fields (also used as backup for reminder/daily_check)
                     "summary": {"type": "string", "description": "Event/reminder title"},
                     "start_time": {"type": "string", "description": "ISO 8601 start time"},
@@ -657,35 +733,16 @@ INTENT_FUNCTION_SCHEMA = {
                         "description": "Time range hint to narrow search for delete_event (e.g. 'tomorrow', 'next week')"
                     }
                 }
-            }
-        },
-        "events_batch": {
-            "type": "array",
-            "description": "Use ONLY when the user requests multiple distinct events in ONE message (e.g. 'workout tomorrow at 8 AND lunch on Wednesday at 13'). Each item is an event object identical to `payload`. When using events_batch, set intent to 'create_event' and leave `payload` as empty object {}.",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string"},
-                    "start_time": {"type": "string"},
-                    "end_time": {"type": "string"},
-                    "attendees": {
-                        "type": "array",
-                        "items": {"type": "string"}
+                        }
                     },
-                    "category": {
-                        "type": "string",
-                        "enum": ["work", "meeting", "personal", "sport", "study", "health", "family", "fun", "general"]
-                    },
-                    "color_name": {
-                        "type": "string",
-                        "enum": ["lavender", "sage", "grape", "flamingo", "banana", "tangerine", "peacock", "graphite", "blueberry", "basil", "tomato"]
-                    },
-                    "location": {"type": "string"},
-                    "is_all_day": {"type": "boolean"},
-                    "original_intent": {"type": "string"}
+                    "required": ["intent", "payload"]
                 }
+            },
+            "response_text": {
+                "type": "string",
+                "description": "A natural, friendly Hebrew response to the user"
             }
         },
-        "required": ["intent", "response_text"]
+        "required": ["actions", "response_text"]
     }
 }
