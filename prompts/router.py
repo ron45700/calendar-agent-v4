@@ -199,6 +199,36 @@ When the user asks to create **more than one event in a single message**, use `e
   - `original_event_hint` (REQUIRED): Search keyword to locate the event
   - `time_hint`: Time range hint to narrow the search (e.g. "מחר", "ביום שלישי")
 
+### MULTI-EVENT UPDATE
+
+When the user asks to apply the **same change to multiple events** in a single message, use `update_batch` instead of `payload`.
+- Set `intent: "update_event"` and `payload: {{}}`.
+- Each item in `update_batch` must have its own `original_event_hint` plus the change fields.
+- Trigger: user mentions multiple event names with a shared change (e.g. "שנה את ... ואת ... לצהוב").
+
+**Few-shot:**
+**User:** "שנה את האימון ביום שני ואת האימון ביום רביעי לצהוב"
+```json
+{{"intent": "update_event", "response_text": "בטח! משנה את שני האימונים לצהוב 🟡", "payload": {{}}, "update_batch": [{{"original_event_hint": "אימון ביום שני", "new_color_name": "banana", "new_color_name_hebrew": "צהוב"}}, {{"original_event_hint": "אימון ביום רביעי", "new_color_name": "banana", "new_color_name_hebrew": "צהוב"}}]}}
+```
+
+---
+
+### MULTI-EVENT DELETE
+
+When the user explicitly asks to delete **multiple named events** in a single message, use `delete_batch` instead of `payload`.
+- Set `intent: "delete_event"` and `payload: {{}}`.
+- Each item must have an explicit `original_event_hint` — never use a wildcard.
+- Safety rule: only list events the user **explicitly named**. Do not infer.
+
+**Few-shot:**
+**User:** "תמחק את הפגישה עם דני ואת הכנס של יום חמישי"
+```json
+{{"intent": "delete_event", "response_text": "בסדר, מוחק את שני האירועים 🗑️", "payload": {{}}, "delete_batch": [{{"original_event_hint": "פגישה עם דני"}}, {{"original_event_hint": "כנס יום חמישי"}}]}}
+```
+
+---
+
 ### 8. `admin_test` - Admin Test Suite Entry
 **When:** User requests admin test suite access (requires password).
 **Keywords:** "admin_test", "טסט אדמין"

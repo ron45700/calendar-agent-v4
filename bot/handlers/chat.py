@@ -30,7 +30,10 @@ from services.openai_service import openai_service
 from services.llm_service import llm_service
 from services.firestore_service import firestore_service
 from bot.utils import get_random_thinking_phrase, get_formatted_current_time
-from bot.handlers.events import process_create_event, process_update_event, process_delete_event, process_multi_event_creation
+from bot.handlers.events import (
+    process_create_event, process_update_event, process_delete_event,
+    process_multi_event_creation, process_multi_event_update, process_multi_event_delete,
+)
 from bot.handlers.onboarding import send_onboarding_intro
 from services.calendar_service import calendar_service
 from utils.performance import measure_time
@@ -690,12 +693,24 @@ async def process_user_intent(
     
     elif intent == "update_event":
         logger.info(f"[Routing] -> update_event")
-        await process_update_event(message, user, state, payload, response_text)
-    
+        # Guard: LLM may nest update_batch inside payload — check both levels
+        update_batch = result.get("update_batch") or payload.get("update_batch", [])
+        if update_batch:
+            logger.info(f"[Routing] -> multi-event update batch ({len(update_batch)} items)")
+            await process_multi_event_update(message, user, state, update_batch, response_text)
+        else:
+            await process_update_event(message, user, state, payload, response_text)
+
     elif intent == "delete_event":
         logger.info(f"[Routing] -> delete_event")
-        await process_delete_event(message, user, state, payload, response_text)
-    
+        # Guard: LLM may nest delete_batch inside payload — check both levels
+        delete_batch = result.get("delete_batch") or payload.get("delete_batch", [])
+        if delete_batch:
+            logger.info(f"[Routing] -> multi-event delete batch ({len(delete_batch)} items)")
+            await process_multi_event_delete(message, user, state, delete_batch, response_text)
+        else:
+            await process_delete_event(message, user, state, payload, response_text)
+
     elif intent == "edit_preferences":
         logger.info(f"[Routing] -> edit_preferences")
         

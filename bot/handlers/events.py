@@ -822,6 +822,262 @@ def _format_event_card(event: dict) -> str:
     return "\n".join(lines)
 
 
+async def process_multi_event_update(
+    message: Message,
+    user: UserData,
+    state: FSMContext,
+    update_batch: List[Dict[str, Any]],
+    response_text: str,
+) -> None:
+    """
+    Apply the same (or similar) update to multiple events in a single pass.
+
+    Each item in update_batch must have:
+      - original_event_hint (REQUIRED): search keyword to locate the event
+      - Any update fields: new_color_name, new_summary, new_start_time, etc.
+
+    For each item:
+      - Searches calendar. Exactly 1 match → patches it.
+      - 0 matches → adds to failures.
+      - >1 matches → adds a clarification note (user can retry individually or via Phase 2 FSM).
+    Sends one consolidated summary at the end to avoid Telegram spam.
+    """
+    user_id = message.from_user.id
+    tokens = get_user_tokens(user)
+    if not tokens:
+        await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        return
+
+    total = len(update_batch)
+    successes: List[str] = []
+    failures: List[str] = []
+
+    status_msg = await message.answer(
+        f"⚡ *מעדכן {total} אירועים...* רגע אחד!",
+        parse_mode="Markdown"
+    )
+
+    for item in update_batch:
+        hint = item.get("original_event_hint", "")
+        if not hint:
+            failures.append("⚠️ פריט ללא `original_event_hint` — דולג")
+            continue
+
+        # 1. Search for the event
+        try:
+            search_result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda h=hint: calendar_service.search_events(
+                        tokens, query=h, user_id=str(user_id)
+                    )
+                ), timeout=10
+            )
+        except asyncio.TimeoutError:
+            failures.append(f"⏳ *{hint}* — timeout בחיפוש")
+            continue
+        except Exception as e:
+            logger.error(f"[MultiUpdate] Search error for '{hint}': {e}")
+            failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
+            continue
+
+        if search_result.get("status") != "success":
+            failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
+            continue
+
+        events = search_result.get("events", [])
+        if len(events) == 0:
+            failures.append(f"🔍 *{hint}* — לא נמצא ביומן")
+            continue
+        if len(events) > 1:
+            failures.append(f"⚠️ *{hint}* — נמצאו {len(events)} תוצאות, פרט יותר או עדכן ידנית")
+            continue
+
+        target_event = events[0]
+        event_id = target_event.get("id")
+        ev_summary = target_event.get("summary", "ללא שם")
+        old_color_id = target_event.get("colorId", "")
+        old_location = target_event.get("location", "")
+
+        # 2. Build updates dict
+        updates: Dict[str, Any] = {}
+        if item.get("new_summary"):
+            updates["summary"] = item["new_summary"]
+        if item.get("new_start_time"):
+            updates["start_time"] = item["new_start_time"]
+            if item.get("new_end_time"):
+                updates["end_time"] = item["new_end_time"]
+        if item.get("new_color_name"):
+            new_color_id = CALENDAR_COLORS.get(item["new_color_name"])
+            if new_color_id:
+                updates["color_id"] = new_color_id
+        if item.get("new_location"):
+            updates["location"] = item["new_location"]
+
+        if not updates:
+            failures.append(f"⚠️ *{ev_summary}* — לא זוהו שינויים")
+            continue
+
+        # 3. Apply the update
+        try:
+            update_result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda eid=event_id, u=updates: calendar_service.update_event(
+                        tokens, event_id=eid, updates=u, user_id=str(user_id)
+                    )
+                ), timeout=10
+            )
+        except asyncio.TimeoutError:
+            failures.append(f"⏳ *{ev_summary}* — timeout בעדכון")
+            continue
+        except Exception as e:
+            logger.error(f"[MultiUpdate] Update error for '{ev_summary}': {e}")
+            failures.append(f"❌ *{ev_summary}* — שגיאה בעדכון")
+            continue
+
+        if update_result.get("status") == "success":
+            new_color_heb = item.get("new_color_name_hebrew", "")
+            color_note = f" (צבע: {new_color_heb})" if new_color_heb else ""
+            successes.append(f"✅ *{ev_summary}*{color_note}")
+        elif update_result.get("type") == ERROR_AUTH_REQUIRED:
+            failures.append(f"🔐 *{ev_summary}* — ההרשאה פגה")
+            break
+        else:
+            failures.append(f"❌ *{ev_summary}* — {update_result.get('message', 'שגיאה')}")
+
+    # Delete spinner
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    # Send consolidated summary
+    lines = [f"📋 *תוצאות עדכון {total} האירועים:*\n"]
+    lines.extend(successes)
+    if failures:
+        if successes:
+            lines.append("")
+        lines.extend(failures)
+    summary_msg = "\n".join(lines)
+    firestore_service.save_message(user_id, "assistant", summary_msg)
+    await message.answer(summary_msg, parse_mode="Markdown")
+
+
+async def process_multi_event_delete(
+    message: Message,
+    user: UserData,
+    state: FSMContext,
+    delete_batch: List[Dict[str, Any]],
+    response_text: str,
+) -> None:
+    """
+    Delete multiple explicitly-named events in a single pass.
+
+    Each item must have original_event_hint.
+    Safety: each deletion is preceded by an individual match check.
+    If more than 1 event matches a hint, it is skipped with a clarification note.
+    A single consolidated summary is sent at the end.
+    """
+    user_id = message.from_user.id
+    tokens = get_user_tokens(user)
+    if not tokens:
+        await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
+        return
+
+    total = len(delete_batch)
+    successes: List[str] = []
+    failures: List[str] = []
+
+    status_msg = await message.answer(
+        f"⚡ *מוחק {total} אירועים...* רגע אחד!",
+        parse_mode="Markdown"
+    )
+
+    for item in delete_batch:
+        hint = item.get("original_event_hint", "")
+        if not hint:
+            failures.append("⚠️ פריט ללא `original_event_hint` — דולג")
+            continue
+
+        # 1. Search for the event
+        try:
+            search_result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda h=hint: calendar_service.search_events(
+                        tokens, query=h, user_id=str(user_id)
+                    )
+                ), timeout=10
+            )
+        except asyncio.TimeoutError:
+            failures.append(f"⏳ *{hint}* — timeout בחיפוש")
+            continue
+        except Exception as e:
+            logger.error(f"[MultiDelete] Search error for '{hint}': {e}")
+            failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
+            continue
+
+        if search_result.get("status") != "success":
+            failures.append(f"❌ *{hint}* — שגיאה בחיפוש")
+            continue
+
+        events = search_result.get("events", [])
+        if len(events) == 0:
+            failures.append(f"🔍 *{hint}* — לא נמצא ביומן")
+            continue
+        if len(events) > 1:
+            failures.append(f"⚠️ *{hint}* — נמצאו {len(events)} תוצאות, פרט יותר או מחק ידנית")
+            continue
+
+        target_event = events[0]
+        event_id = target_event.get("id")
+        ev_summary = target_event.get("summary", "ללא שם")
+
+        # 2. Delete
+        try:
+            delete_result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda eid=event_id: calendar_service.delete_event(
+                        tokens, event_id=eid, user_id=str(user_id)
+                    )
+                ), timeout=10
+            )
+        except asyncio.TimeoutError:
+            failures.append(f"⏳ *{ev_summary}* — timeout במחיקה")
+            continue
+        except Exception as e:
+            logger.error(f"[MultiDelete] Delete error for '{ev_summary}': {e}")
+            failures.append(f"❌ *{ev_summary}* — שגיאה במחיקה")
+            continue
+
+        if delete_result.get("status") == "success":
+            successes.append(f"🗑️ *{ev_summary}* — נמחק")
+        elif delete_result.get("type") == ERROR_AUTH_REQUIRED:
+            failures.append(f"🔐 *{ev_summary}* — ההרשאה פגה")
+            break
+        else:
+            failures.append(f"❌ *{ev_summary}* — {delete_result.get('message', 'שגיאה')}")
+
+    # Delete spinner
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    # Send consolidated summary
+    lines = [f"📋 *תוצאות מחיקת {total} האירועים:*\n"]
+    lines.extend(successes)
+    if failures:
+        if successes:
+            lines.append("")
+        lines.extend(failures)
+    summary_msg = "\n".join(lines)
+    firestore_service.save_message(user_id, "assistant", summary_msg)
+    await message.answer(summary_msg, parse_mode="Markdown")
+
+
+# =============================================================================
+# Update Event Handler
+# =============================================================================
+
 async def process_update_event(
     message: Message,
     user: UserData,
