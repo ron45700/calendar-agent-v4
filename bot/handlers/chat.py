@@ -403,12 +403,14 @@ async def process_user_intent(
     
     if intent == "create_event":
         logger.info(f"[Routing] -> create_event")
-        events_batch = result.get("events_batch", [])
+        # Guard: LLM sometimes nests events_batch inside payload instead of root
+        events_batch = result.get("events_batch") or payload.get("events_batch", [])
         if events_batch:
             logger.info(f"[Routing] -> multi-event batch ({len(events_batch)} events)")
             await process_multi_event_creation(message, user, state, events_batch, response_text)
         else:
             await process_create_event(message, user, state, payload, response_text)
+
 
     elif intent == "start_onboarding":
         logger.info(f"[Routing] -> start_onboarding")
@@ -453,10 +455,10 @@ async def process_user_intent(
 
         # Daily features
         lines += [
-            "",
-            f"☀️ *הצגת הלוז בבוקר:* {'\u05deופעל ✅' if daily_briefing else 'כבוי 🔕'}",
-            f"🔔 *הוספת 'תזכורת' לאירועים:* {'\u05deופעל ✅' if reminder_mode else 'כבוי 🔕'}",
-        ]
+    "",
+    f"☀️ *הצגת הלוז בבוקר:* {'מופעל ✅' if daily_briefing else 'כבוי 🔕'}\n",
+    f"🔔 *הוספת 'תזכורת' לאירועים:* {'מופעל ✅' if reminder_mode else 'כבוי 🔕'}",
+]
 
         # Contacts
         lines.append("")

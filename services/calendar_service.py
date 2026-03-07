@@ -228,14 +228,26 @@ class CalendarService:
         """
         # Get calendar service with auth check
         service, error = self._get_calendar_service(user_tokens, user_id)
-        
+
         if service is None:
             print(f"[Calendar] Auth failed: {error}")
             if error == ERROR_AUTH_REQUIRED:
                 return {"status": "error", "type": ERROR_AUTH_REQUIRED, "message": "User needs to re-login"}
             else:
                 return {"status": "error", "type": ERROR_GENERIC, "message": "Failed to connect to calendar"}
-        
+
+        # Strict guard: missing dates would cause Google API HTTP 400
+        start_time = event_data.get("start_time")
+        end_time = event_data.get("end_time")
+        if not start_time or not end_time:
+            print(f"[Calendar] ❌ add_event called with missing dates: start={start_time!r}, end={end_time!r}")
+            return {
+                "status": "error",
+                "type": ERROR_GENERIC,
+                "message": f"start_time and end_time cannot be None (got start={start_time!r}, end={end_time!r})"
+            }
+
+
         try:
             # Build event body
             event_body = {

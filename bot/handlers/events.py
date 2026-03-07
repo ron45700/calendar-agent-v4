@@ -124,6 +124,157 @@ def resolve_attendee_emails(
 
 
 # =============================================================================
+# Core Event Engine (shared by single and multi-event flows)
+# =============================================================================
+
+async def _process_event_core(
+    ev_payload: Dict[str, Any],
+    tokens: Dict[str, str],
+    user_id: int,
+    user: UserData,
+) -> Dict[str, Any]:
+    """
+    Single source of truth for all event creation logic.
+
+    Handles:
+    - Reminder Mode: prefix + Tangerine color override
+    - Color resolution: explicit → payload → user prefs → default
+    - Attendee email resolution
+    - All-day end_time guard
+    - calendar_service.add_event call
+
+    Returns a result dict:
+        {
+          "status": "success" | "error" | "auth",
+          "summary": str,
+          "color_hebrew": str,
+          "color_id": int | None,
+          "event_link": str,
+          "day_str": str,
+          "raw_result": dict,   # full API response
+        }
+    """
+    from services.calendar_service import DEFAULT_COLOR_ID
+
+    summary = ev_payload.get("summary", "אירוע")
+    user_contacts = user.get("contacts", {})
+
+    # --- 1. Reminder Mode: prefix + force Tangerine -------------------------
+    if ev_payload.get("original_intent") == "set_reminder":
+        reminder_mode_on = user.get("preferences", {}).get("reminder_mode", False)
+        if reminder_mode_on:
+            if not summary.startswith("תזכורת: "):
+                summary = f"תזכורת: {summary}"
+                ev_payload["summary"] = summary
+            ev_payload["color_name"] = "tangerine"
+            logger.info(f"[Reminder] Mode ON — applied prefix + tangerine to: {summary}")
+
+    # --- 2. Attendee email resolution ---------------------------------------
+    attendee_names = ev_payload.get("attendees", [])
+    if attendee_names:
+        resolved = resolve_attendee_emails(attendee_names, user_contacts)
+        ev_payload["resolved_attendees"] = resolved
+
+    # --- 3. Color resolution ------------------------------------------------
+    category = ev_payload.get("category", "general")
+    color_map = user.get("calendar_config", {}).get("color_map", {})
+    color_name = ev_payload.get("color_name")
+    color_id = None
+    color_source = "default"
+
+    if color_name:
+        canonical = HEBREW_COLOR_MAP.get(color_name, color_name)
+        color_id = CALENDAR_COLORS.get(canonical)
+        if color_id:
+            color_source = f"explicit '{color_name}' → '{canonical}' → {color_id}"
+        else:
+            logger.warning(f"[Color] Unknown color name '{color_name}' (canonical: '{canonical}')")
+
+    if not color_id and ev_payload.get("color_id"):
+        color_id = ev_payload.get("color_id")
+        color_source = f"payload color_id={color_id}"
+
+    if not color_id and color_map and category in color_map:
+        color_id = color_map[category]
+        color_source = f"user prefs '{category}' → {color_id}"
+
+    if not color_id:
+        color_id = DEFAULT_COLOR_ID
+        color_source = f"default Tangerine ({DEFAULT_COLOR_ID})"
+
+    logger.info(f"[Color] Resolved: {color_source}")
+
+    # Map the final color_id back to a Hebrew display name
+    COLOR_ID_TO_HEBREW = {
+        1: "לבנדר", 2: "מרווה", 3: "סגול",
+        4: "פלמינגו", 5: "בננה", 6: "כתום",
+        7: "תכלת", 8: "אפור", 9: "כחול",
+        10: "ירוק", 11: "אדום",
+    }
+    color_hebrew = COLOR_ID_TO_HEBREW.get(int(color_id) if color_id else 7, "תכלת")
+
+    # --- 4. All-day guard ---------------------------------------------------
+    if ev_payload.get("is_all_day") and not ev_payload.get("end_time"):
+        try:
+            start_date = datetime.fromisoformat(ev_payload["start_time"])
+            ev_payload["end_time"] = (start_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info(f"[AllDay] Auto-set end_time to {ev_payload['end_time']}")
+        except Exception as e:
+            logger.warning(f"[AllDay] Failed to auto-set end_time: {e}")
+
+    # --- 5. Create via Google Calendar API ---------------------------------
+    try:
+        raw_result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda p=ev_payload, cid=color_id: calendar_service.add_event(
+                    user_tokens=tokens,
+                    event_data=p,
+                    color_id=int(cid) if cid else None,
+                    user_id=str(user_id)
+                )
+            ),
+            timeout=15
+        )
+    except asyncio.TimeoutError:
+        return {"status": "timeout", "summary": summary, "color_hebrew": color_hebrew,
+                "color_id": color_id, "event_link": "", "day_str": "", "raw_result": {}}
+    except Exception as e:
+        logger.error(f"[EventCore] Unexpected error for '{summary}': {e}")
+        return {"status": "error", "summary": summary, "color_hebrew": color_hebrew,
+                "color_id": color_id, "event_link": "", "day_str": "", "raw_result": {}}
+
+    if raw_result.get("status") != "success":
+        status_key = "auth" if raw_result.get("type") == ERROR_AUTH_REQUIRED else "error"
+        return {"status": status_key, "summary": summary, "color_hebrew": color_hebrew,
+                "color_id": color_id, "event_link": "", "day_str": "", "raw_result": raw_result}
+
+    # --- 6. Build return dict from API response ----------------------------
+    created_ev = raw_result.get("event", {})
+    event_link = created_ev.get("htmlLink", "")
+    start_raw = created_ev.get("start", {})
+    day_str = ""
+    if "dateTime" in start_raw:
+        try:
+            dt = datetime.fromisoformat(start_raw["dateTime"])
+            day_names = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+            day_str = f"{dt.strftime('%H:%M')} יום {day_names[dt.weekday()]}"
+        except Exception:
+            pass
+    elif "date" in start_raw:
+        day_str = start_raw["date"]
+
+    return {
+        "status": "success",
+        "summary": summary,
+        "color_hebrew": color_hebrew,
+        "color_id": color_id,
+        "event_link": event_link,
+        "day_str": day_str,
+        "raw_result": raw_result,
+    }
+
+
+# =============================================================================
 # Multi-Event Creation (Batch Mode)
 # =============================================================================
 
@@ -137,19 +288,15 @@ async def process_multi_event_creation(
     """
     Process multiple events from a single user message (events_batch payload).
 
-    Creates events sequentially. Tracks successes and failures.
-    Sends one consolidated summary message at the end.
+    Delegates each event to _process_event_core for consistent behaviour.
+    Aggregates results into one consolidated summary message.
 
-    Design decisions:
-    - Events that require FSM pauses (missing contacts, no recurrence end date)
-      are skipped with a note — the user can create them individually.
-    - Auth errors on any event abort the remaining batch.
-    - Color resolution mirrors create_event_from_payload exactly.
+    Events that need FSM pauses (missing contacts, open-ended recurrence)
+    are skipped with a note so the user can create them individually.
     """
     user_id = message.from_user.id
     user_contacts = user.get("contacts", {})
     tokens = get_user_tokens(user)
-    color_map = user.get("calendar_config", {}).get("color_map", {})
 
     if not tokens:
         await message.answer("🔐 ההרשאה שלך פגה.\nשלח /auth כדי להתחבר מחדש.")
@@ -164,101 +311,56 @@ async def process_multi_event_creation(
         parse_mode="Markdown"
     )
 
+    abort_remaining = False
     for ev_payload in events_batch:
+        if abort_remaining:
+            break
+
         summary = ev_payload.get("summary", "אירוע")
 
-        # Skip events that need FSM interaction (batch can't pause mid-flow)
+        # Guard: missing date
+        if not ev_payload.get("start_time"):
+            logger.warning(f"[MultiEvent] Skipping '{summary}' — start_time is None")
+            failures.append(f"⚠️ *{summary}* — לא צוינו תאריך ושעה (צור ידנית)")
+            continue
+
+        # Guard: missing contact email (can't pause FSM mid-batch)
         attendee_names = ev_payload.get("attendees", [])
         if attendee_names:
             missing = find_missing_contacts(attendee_names, user_contacts)
             if missing:
-                failures.append(
-                    f"❌ *{summary}* — חסר מייל של {missing[0]} (צור ידנית)"
-                )
+                failures.append(f"❌ *{summary}* — חסר מייל של {missing[0]} (צור ידנית)")
                 continue
 
+        # Guard: open-ended recurrence (can't pause FSM mid-batch)
         if ev_payload.get("recurrence_freq") and not ev_payload.get("recurrence_end_date"):
             failures.append(f"⚠️ *{summary}* — אירוע חוזר ללא תאריך סיום (צור ידנית)")
             continue
 
-        # --- Resolve attendee emails (mirrors create_event_from_payload) ---
-        if attendee_names:
-            resolved = resolve_attendee_emails(attendee_names, user_contacts)
-            ev_payload["resolved_attendees"] = resolved
+        # Delegate to core engine
+        core = await _process_event_core(ev_payload, tokens, user_id, user)
 
-        # --- Color resolution (mirrors create_event_from_payload exactly) ---
-        category = ev_payload.get("category", "general")
-        color_name = ev_payload.get("color_name")
-        color_id = None
-
-        if color_name:
-            canonical = HEBREW_COLOR_MAP.get(color_name, color_name)
-            color_id = CALENDAR_COLORS.get(canonical)
-
-        if not color_id and ev_payload.get("color_id"):
-            color_id = ev_payload.get("color_id")
-
-        if not color_id and color_map and category in color_map:
-            color_id = color_map[category]
-
-        if not color_id:
-            from services.calendar_service import DEFAULT_COLOR_ID
-            color_id = DEFAULT_COLOR_ID
-
-        # --- All-day guard ---
-        if ev_payload.get("is_all_day") and not ev_payload.get("end_time"):
-            try:
-                start_date = datetime.fromisoformat(ev_payload["start_time"])
-                ev_payload["end_time"] = (start_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            except Exception:
-                pass
-
-        # --- Create the event via add_event (same as single-event flow) ---
-        try:
-            create_result = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, lambda ev=ev_payload, cid=color_id: calendar_service.add_event(
-                        user_tokens=tokens,
-                        event_data=ev,
-                        color_id=int(cid) if cid else None,
-                        user_id=str(user_id)
-                    )
-                ),
-                timeout=12
-            )
-        except asyncio.TimeoutError:
-            failures.append(f"⏳ *{summary}* — timeout ב-Google Calendar")
-            continue
-        except Exception as e:
-            logger.error(f"[MultiEvent] Error creating '{summary}': {e}")
-            failures.append(f"❌ *{summary}* — שגיאה לא צפויה")
-            continue
-
-        if create_result.get("status") == "success":
-            created_ev = create_result.get("event", {})
-            start_raw = created_ev.get("start", {})
-            day_str = ""
-            if "dateTime" in start_raw:
-                try:
-                    dt = datetime.fromisoformat(start_raw["dateTime"])
-                    day_names = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
-                    day_str = f" | {dt.strftime('%H:%M')} יום {day_names[dt.weekday()]}"
-                except Exception:
-                    pass
-            successes.append(f"✅ *{summary}*{day_str}")
-        elif create_result.get("type") == ERROR_AUTH_REQUIRED:
+        if core["status"] == "success":
+            line = f"✅ *{core['summary']}*"
+            if core["day_str"]:
+                line += f" | {core['day_str']}"
+            line += f" (צבע: {core['color_hebrew']})"
+            successes.append(line)
+        elif core["status"] == "auth":
             failures.append(f"🔐 *{summary}* — ההרשאה פגה, בוטלו שאר האירועים")
-            break
+            abort_remaining = True
+        elif core["status"] == "timeout":
+            failures.append(f"⏳ *{summary}* — timeout ב-Google Calendar")
         else:
-            failures.append(f"❌ *{summary}* — {create_result.get('message', 'שגיאה')}")
+            failures.append(f"❌ *{summary}* — {core['raw_result'].get('message', 'שגיאה')}")
 
-    # Delete status message
+    # Delete status spinner
     try:
         await status_msg.delete()
     except Exception:
         pass
 
-    # Build and send summary
+    # Build and send consolidated summary
     lines = [f"📋 *תוצאות יצירת {total} האירועים:*\n"]
     lines.extend(successes)
     if failures:
@@ -269,9 +371,6 @@ async def process_multi_event_creation(
     summary_msg = "\n".join(lines)
     firestore_service.save_message(user_id, "assistant", summary_msg)
     await message.answer(summary_msg, parse_mode="Markdown")
-
-
-
 
 # =============================================================================
 # Event Creation from Intent Payload
@@ -391,11 +490,15 @@ async def create_event_from_payload(
     response_text: str
 ) -> None:
     """
-    Create Google Calendar event from intent payload.
+    Create a single Google Calendar event from an intent payload.
+
+    Delegates all business logic to _process_event_core().
+    Handles auth tokens, missing-date guard, and sends the
+    rich single-event confirmation card to Telegram.
     """
     user_id = message.from_user.id
-    
-    # Get user tokens
+
+    # Token guard
     tokens = get_user_tokens(user)
     if not tokens:
         await message.answer(
@@ -403,114 +506,48 @@ async def create_event_from_payload(
             "שלח /auth כדי להתחבר מחדש."
         )
         return
-    
-    # Resolve attendees to emails
-    user_contacts = user.get("contacts", {})
-    attendee_names = payload.get("attendees", [])
-    
-    if attendee_names:
-        resolved = resolve_attendee_emails(attendee_names, user_contacts)
-        payload["resolved_attendees"] = resolved
-    
-    # Color hierarchy: Explicit Name > Payload ID > User Prefs > Default (Tangerine)
-    category = payload.get("category", "general")
-    color_map = user.get("calendar_config", {}).get("color_map", {})
-    color_name = payload.get("color_name")
-    color_id = None
-    color_source = "default"  # For debug logging
-    
-    # 1. Explicit color name from LLM (highest priority)
-    if color_name:
-        # Normalize: try Hebrew→canonical translation, then direct lookup
-        canonical = HEBREW_COLOR_MAP.get(color_name, color_name)
-        color_id = CALENDAR_COLORS.get(canonical)
-        if color_id:
-            color_source = f"explicit '{color_name}' → '{canonical}' → {color_id}"
-        else:
-            logger.warning(f"[Color] Unknown color name '{color_name}' (canonical: '{canonical}')")
-    
-    # 2. Fallback to payload color_id
-    if not color_id and payload.get("color_id"):
-        color_id = payload.get("color_id")
-        color_source = f"payload color_id={color_id}"
-    
-    # 3. Fallback to user's custom category preferences
-    if not color_id and color_map and category in color_map:
-        color_id = color_map[category]
-        color_source = f"user prefs '{category}' → {color_id}"
-    
-    # 4. Final fallback: default Tangerine (only if nothing else matched)
-    if not color_id:
-        from services.calendar_service import DEFAULT_COLOR_ID
-        color_id = DEFAULT_COLOR_ID
-        color_source = f"default Tangerine ({DEFAULT_COLOR_ID})"
-    
-    logger.info(f"[Color] Resolved: {color_source}")
-    
-    # All-day event guard: ensure end_time is set (Google API requires it)
-    if payload.get("is_all_day") and not payload.get("end_time"):
-        try:
-            start_date = datetime.fromisoformat(payload["start_time"])
-            payload["end_time"] = (start_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            logger.info(f"[AllDay] Auto-set end_time to {payload['end_time']}")
-        except Exception as e:
-            logger.warning(f"[AllDay] Failed to auto-set end_time: {e}")
-    
-    # Create event - pass user_id for auth cleanup on failure
-    result = calendar_service.add_event(
-        user_tokens=tokens,
-        event_data=payload,
-        color_id=int(color_id) if color_id else None,
-        user_id=str(user_id)
-    )
-    
-    # Check result status - CRITICAL: Don't lie to user!
-    if result.get("status") != "success":
-        error_type = result.get("type", ERROR_GENERIC)
-        print(f"[Event] ❌ add_event failed with type: {error_type}")
-        
-        if error_type == ERROR_AUTH_REQUIRED:
-            # Auth failed - credentials cleared, need re-login
-            # Use simple text to avoid Markdown parsing issues
-            auth_link = f"{WEBAPP_URL}/auth?user_id={user_id}"
-            error_response = (
-                "🔐 החיבור ליומן התנתק\n\n"
-                "מטעמי אבטחה, Google מנתק את החיבור מדי פעם.\n\n"
-                "שלח /auth להתחברות מחדש."
-            )
-            # Send without Markdown to avoid parsing issues
-            firestore_service.save_message(user_id, "assistant", error_response)
-            await message.answer(error_response)
-        else:
-            # Generic Error - SANITIZED: Never show raw error to user
-            error_response = (
-                "❌ נתקלתי בשגיאה טכנית\n\n"
-                "לא הצלחתי ליצור את האירוע כרגע.\n"
-                "נסה שוב מאוחר יותר."
-            )
-            # Send without Markdown to avoid parsing issues
-            firestore_service.save_message(user_id, "assistant", error_response)
-            await message.answer(error_response)
+
+    # Missing date guard (LLM hallucination protection)
+    if not payload.get("start_time"):
+        logger.warning("[Event] start_time is None — asking user to clarify")
+        await message.answer(
+            "חסרים לי פרטים על התאריך והשעה כדי לקבוע את האירוע. "
+            "תוכל לפרט מתי בדיוק תרצה אותו?"
+        )
         return
-    
-    # SUCCESS - event was created
-    created_event = result.get("event", {})
-    event_link = created_event.get("htmlLink", "")
-    summary = payload.get("summary", "אירוע")
-    
-    # Format success message
+
+    # Delegate to shared core engine
+    core = await _process_event_core(payload, tokens, user_id, user)
+
+    # Handle errors
+    if core["status"] == "auth":
+        error_response = (
+            "🔐 החיבור ליומן התנתק\n\n"
+            "מטעמי אבטחה, Google מנתק את החיבור מדי פעם.\n\n"
+            "שלח /auth להתחברות מחדש."
+        )
+        firestore_service.save_message(user_id, "assistant", error_response)
+        await message.answer(error_response)
+        return
+
+    if core["status"] in ("error", "timeout"):
+        error_response = (
+            "❌ נתקלתי בשגיאה טכנית\n\n"
+            "לא הצלחתי ליצור את האירוע כרגע.\n"
+            "נסה שוב מאוחר יותר."
+        )
+        firestore_service.save_message(user_id, "assistant", error_response)
+        await message.answer(error_response)
+        return
+
+    # SUCCESS — build confirmation card using verified values from core
     confirmation = await llm_service.confirm_event_details(payload)
-    
     success_response = (
         f"✅ האירוע נוצר בהצלחה!\n\n"
         f"{confirmation}\n"
-        f"פתח ביומן: {event_link}"
+        f"פתח ביומן: {core['event_link']}"
     )
-    
-    # Save assistant response to history
     firestore_service.save_message(user_id, "assistant", success_response)
-    
-    # Send without Markdown to be safe
     await message.answer(success_response, disable_web_page_preview=True)
 
 
