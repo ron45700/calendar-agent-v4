@@ -421,6 +421,7 @@ async def _fetch_and_filter_events(
                 )
             ), timeout=10
         )
+
     except asyncio.TimeoutError:
         logger.warning("[FetchFilter] Timeout")
         return ("timeout", [])
