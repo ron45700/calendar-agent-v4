@@ -3,7 +3,7 @@ Agentic Calendar 2.0 - Main Entry Point
 Smart Hybrid Mode: Auto-switches between Webhooks (Cloud Run) and Polling (Local).
 
 CRITICAL: This implementation properly handles the Webhook/Polling conflict by:
-- Webhook Mode: Sets webhook on startup, includes OAuth callback route
+- Webhook Mode: Binds port 8080 FIRST, then sets webhook in background
 - Polling Mode: ALWAYS deletes webhook before starting polling
 
 Detection Logic: Checks BASE_WEBHOOK_URL environment variable.
@@ -79,88 +79,103 @@ async def daily_briefing_handler(request: web.Request) -> web.Response:
 # Webhook Mode (Cloud Run / Production)
 # =============================================================================
 
-async def on_startup_webhook(bot: Bot) -> None:
-    """Called on startup in webhook mode - sets the webhook URL."""
-    webhook_url = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
-    await bot.set_webhook(
-        url=webhook_url,
-        allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True
-    )
-    logger.info(f"✅ Webhook set: {webhook_url}")
-
-
-async def on_shutdown_webhook(bot: Bot) -> None:
-    """Called on shutdown in webhook mode - deletes webhook."""
-    await bot.delete_webhook()
-    logger.info("🔄 Webhook deleted on shutdown")
-
-
 async def run_webhook_mode(bot: Bot, dp: Dispatcher) -> None:
     """
     Run in Webhook mode for Cloud Run.
-    Sets up aiohttp server with:
-    - Health check endpoints (/, /health)
-    - Telegram webhook endpoint (/webhook/{token})
-    - OAuth2 callback endpoint (/oauth2callback)
+
+    Cloud Run requires the container to bind PORT within the startup timeout.
+    Strategy:
+      1. Build the aiohttp app (no blocking calls).
+      2. Bind TCP port 8080 via site.start() FIRST.
+      3. THEN fire bot.set_webhook() in a background task.
+    This guarantees port 8080 is always listening before set_webhook() is attempted.
     """
     logger.info("=" * 50)
     logger.info("🌐 WEBHOOK MODE (Cloud Run)")
     logger.info("=" * 50)
     
-    # Set bot instance for OAuth callback to send messages
+    # Set bot instance for OAuth callback
     set_bot_instance(bot)
-    
-    # Register startup/shutdown handlers
-    dp.startup.register(on_startup_webhook)
-    dp.shutdown.register(on_shutdown_webhook)
     
     # Create aiohttp application
     app = web.Application()
     
-    # Health check routes (Cloud Run requirement)
+    # Health check routes (Cloud Run REQUIRES these to be reachable immediately)
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
     
-    # OAuth2 callback route (Google OAuth redirect)
+    # OAuth2 callback route
     app.router.add_get("/oauth2callback", oauth_callback)
-    logger.info("📝 Registered /oauth2callback route")
     
-    # Webhook handler for Telegram updates
+    # Telegram webhook handler
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path=WEBHOOK_PATH)
     
-    # Setup application with aiogram integration
+    # Wire aiogram dispatcher into aiohttp lifecycle (message handling only)
+    # NOTE: we do NOT register dp.startup hooks here to avoid any blocking
+    # before site.start() is called.
     setup_application(app, dp, bot=bot)
     
-    # Store bot in app for route handlers
+    # Store bot reference in app
     app["bot"] = bot
     
-    # Task routes (Cloud Scheduler triggers)
+    # Cloud Scheduler trigger route
     app.router.add_post("/tasks/daily-briefing", daily_briefing_handler)
-    logger.info("📋 Registered /tasks/daily-briefing route")
     
-    # Start aiohttp server
+    # =========================================================================
+    # STEP 1: Bind port 8080 FIRST.
+    # Cloud Run health check hits GET / immediately after startup.
+    # This MUST succeed before we do any external network calls.
+    # =========================================================================
     runner = web.AppRunner(app)
     await runner.setup()
     
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
     
-    logger.info(f"✅ Server listening on 0.0.0.0:{PORT}")
+    logger.info(f"✅ Port {PORT} bound on 0.0.0.0 — Cloud Run health check will pass")
     logger.info(f"📡 Webhook path: {WEBHOOK_PATH}")
     logger.info(f"🔑 OAuth callback: /oauth2callback")
-    logger.info("🤖 Bot running. Press Ctrl+C to stop.")
+    logger.info("🤖 Bot is running!")
     
-    # Keep server running forever
+    # =========================================================================
+    # STEP 2: Register Telegram webhook AFTER port is already bound.
+    # Any delay in set_webhook() (network, Telegram rate-limiting, etc.)
+    # no longer threatens the Cloud Run startup timeout.
+    # =========================================================================
+    webhook_url = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
+    
+    async def _register_webhook():
+        try:
+            await asyncio.sleep(2)  # Small delay to let the event loop stabilise
+            logger.info(f"⏳ Registering Telegram webhook: {webhook_url}")
+            await bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True
+            )
+            logger.info("✅ Telegram webhook registered successfully!")
+        except Exception as e:
+            logger.error(f"❌ set_webhook failed: {e}")
+    
+    asyncio.ensure_future(_register_webhook())
+    
+    # Keep server alive
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
         logger.info("🛑 Shutting down...")
+        try:
+            await bot.delete_webhook()
+        except Exception:
+            pass
         await runner.cleanup()
-        await bot.session.close()
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
         logger.info("👋 Goodbye!")
 
 
@@ -228,10 +243,25 @@ async def main() -> None:
     
     logger.info("🚀 Starting Agentic Calendar 2.0...")
     
+    # Force IPv4 resolution for Cloud Run (prevents IPv6 DNS drops/hangs).
+    # We subclass AiohttpSession to avoid version-specific constructor differences.
+    import socket
+    import aiohttp
+    from aiogram.client.session.aiohttp import AiohttpSession
+
+    class IPv4AiohttpSession(AiohttpSession):
+        async def create_session(self):
+            """Override to force IPv4-only TCP connector."""
+            connector = aiohttp.TCPConnector(family=socket.AF_INET)
+            return aiohttp.ClientSession(connector=connector)
+
+    session = IPv4AiohttpSession()
+
     # Initialize bot
     bot = Bot(
         token=TELEGRAM_BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=session
     )
     
     # Create dispatcher
